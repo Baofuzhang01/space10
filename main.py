@@ -294,7 +294,10 @@ def strategic_first_attempt(
             fidEnc=fid_enc or "",
         )
 
-        # 连接预热：发一次真实的 token GET 请求（结果丢弃），建好 TCP+TLS 连接，后续复用省 ~100-200ms
+        # 连接预热：在 T-4s 发一次真实的 token GET 请求（结果丢弃），建好 TCP+TLS 连接，后续复用省 ~100-200ms
+        warm_dt = target_dt - datetime.timedelta(seconds=4)
+        while _beijing_now() < warm_dt:
+            time.sleep(0.05)
         s.warm_connection(_token_url)
 
         if SUBMIT_MODE == "burst":

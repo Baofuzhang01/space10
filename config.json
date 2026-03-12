@@ -52,16 +52,16 @@
             "",
             "【组合5】mode=C  submit_mode=serial  （预热连接·到点取token·串行重试）★★ 推荐",
             "  时序：",
-            "    登录完成后  →  发一个无关紧要的 GET 请求预热 TCP+TLS 连接",
+            "    T - 4s  →  发一个真实的 token GET 请求（结果丢弃）预热 TCP+TLS 连接",
             "    T + token_fetch_delay_ms  →  取 token1（连接已预热，省去握手延迟）",
             "    拿到 token 后立即提交第1枪，等结果",
             "    失败 → 现取 token2，延迟 target_offset2_ms 后提交第2枪",
             "    失败 → 现取 token3，延迟 target_offset3_ms 后提交第3枪",
-            "  原理：提前预热连接池（TCP+TLS），开放后 GET 只需收发数据，省 ~100-200ms。",
+            "  原理：T-4s 预热连接池（TCP+TLS），开放后 GET 只需收发数据，省 ~100-200ms。",
             "",
             "【组合6】mode=C  submit_mode=burst   （预热连接·到点取token·并行连发）",
             "  时序：",
-            "    登录完成后  →  预热连接",
+            "    T - 4s  →  预热连接（真实 GET，结果丢弃）",
             "    T + token_fetch_delay_ms  →  取 1 份 token，复用给所有线程",
             "    T + burst_offsets_ms[0/1/2]  →  各线程直接 POST（零 GET 延迟）",
             "  适合：预热连接 + burst 连发的组合。",
@@ -83,7 +83,7 @@
         "mode": "C",
 
         "_comment_submit_mode": "提交模式：serial = 串行重试（每枪等 HTTP 响应后再决定是否继续）；burst = 定时连发（按 burst_offsets_ms 时间表多线程同时发射，互不等待结果）。",
-        "submit_mode": "burst",
+        "submit_mode": "serial",
 
         "_comment_login_lead_seconds": "在目标时间前多少秒开始登录 + session 预热。",
         "login_lead_seconds": 14,
@@ -105,7 +105,7 @@
         "burst_offsets_ms": [422, 815, 1180],
 
         "_comment_token_fetch_delay_ms": "[仅 mode=C] 目标时间后多少毫秒发起 GET 取 token。连接已预热，实际延迟仅为数据传输时间。建议 0~100。",
-        "token_fetch_delay_ms": 6
+        "token_fetch_delay_ms": 9
     },
 
     "_comment_tulingcloud": "图灵云打码平台配置（可选，用于本地开发测试，GitHub Actions 中从 secrets 读取）",
