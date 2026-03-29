@@ -45,6 +45,39 @@ def _beijing_now() -> datetime.datetime:
     return datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
 
 
+def _wait_until(
+    target_dt: datetime.datetime,
+    *,
+    coarse_sleep_s: float = 0.05,
+    medium_sleep_s: float = 0.005,
+    fine_sleep_s: float = 0.001,
+    spin_window_ms: float = 2.0,
+) -> None:
+    """分段等待到目标时刻，尽量压低 oversleep 带来的毫秒级误差。"""
+    spin_window_s = max(0.0, spin_window_ms / 1000.0)
+
+    while True:
+        remaining_s = (target_dt - _beijing_now()).total_seconds()
+        if remaining_s <= 0:
+            return
+
+        if remaining_s > 0.2:
+            time.sleep(min(coarse_sleep_s, remaining_s / 2))
+            continue
+
+        if remaining_s > 0.02:
+            time.sleep(min(medium_sleep_s, max(0.0, remaining_s - 0.01)))
+            continue
+
+        if remaining_s > spin_window_s:
+            time.sleep(min(fine_sleep_s, max(0.0, remaining_s - spin_window_s)))
+            continue
+
+        while _beijing_now() < target_dt:
+            pass
+        return
+
+
 from utils import AES_Decrypt, reserve, get_user_credentials
 from utils.reserve import CredentialRejectedError
 
@@ -107,8 +140,8 @@ def _pick_ordered_fallback_seat(
     return formatted_seat, formatted_offset
 
 
-ENDTIME = "20:00:40"  # 根据学校的预约座位时间+40ms即可
-WARM_CONNECTION_LEAD_MS = 2200  # 连接预热提前量（毫秒）
+ENDTIME = "22:00:40"  # 根据学校的预约座位时间+40ms即可
+WARM_CONNECTION_LEAD_MS = 2500  # 连接预热提前量（毫秒）
 FIRST_TOKEN_DATE_MODE = "today"  # 首次取 token 的日期：today 或 submit_date
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
@@ -325,8 +358,7 @@ def _probe_then_get_page_token(
     probe_start_dt = target_dt + datetime.timedelta(milliseconds=FAST_PROBE_START_OFFSET_MS)
     probe_deadline_dt = target_dt + datetime.timedelta(milliseconds=FAST_PROBE_DEADLINE_MS)
     if _beijing_now() < probe_start_dt:
-        while _beijing_now() < probe_start_dt:
-            time.sleep(0.001)
+        _wait_until(probe_start_dt)
 
     if start_log_message:
         logging.info("%s，实际启动时间 %s", start_log_message, _beijing_now())
@@ -372,8 +404,7 @@ def _probe_then_get_page_token(
         break
 
     if formal_fetch_not_before is not None and _beijing_now() < formal_fetch_not_before:
-        while _beijing_now() < formal_fetch_not_before:
-            time.sleep(0.001)
+        _wait_until(formal_fetch_not_before)
 
     return s._get_page_token(
         token_url,
@@ -395,8 +426,7 @@ def _burst_shot_worker(
     否则在发射时刻现场获取（有网络延迟）。
     """
     fire_dt = target_dt + datetime.timedelta(milliseconds=offset_ms)
-    while _beijing_now() < fire_dt:
-        time.sleep(0.001)
+    _wait_until(fire_dt)
 
     logging.info(
         f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
@@ -461,8 +491,7 @@ def strategic_first_attempt(
 
     # 等到“目标时间前若干秒”附近再开始策略流程，由 cron 提前少量时间启动
     thirty_before = target_dt - datetime.timedelta(seconds=STRATEGY_LOGIN_LEAD_SECONDS)
-    while _beijing_now() < thirty_before:
-        time.sleep(0.5)
+    _wait_until(thirty_before)
 
     usernames_list, passwords_list = None, None
     if action:
@@ -586,8 +615,7 @@ def strategic_first_attempt(
             # 2. 等到“目标时间前若干秒”，预热滑块验证码，提前拿到多份 validate（如果启用了滑块）
             if ENABLE_SLIDER or ENABLE_TEXTCLICK:
                 ten_before = target_dt - datetime.timedelta(seconds=STRATEGY_SLIDER_LEAD_SECONDS)
-                while _beijing_now() < ten_before:
-                    time.sleep(0.1)
+                _wait_until(ten_before)
 
             if ENABLE_SLIDER:
                 def _resolve_slide_captcha_parallel(slot_idx: int) -> str:
@@ -863,8 +891,7 @@ def strategic_first_attempt(
                 warm_dt = target_dt - datetime.timedelta(
                     milliseconds=WARM_CONNECTION_LEAD_MS
                 )
-                while _beijing_now() < warm_dt:
-                    time.sleep(0.05)
+                _wait_until(warm_dt)
                 s.warm_connection(_warm_url)
                 warm_done = True
 
@@ -876,8 +903,7 @@ def strategic_first_attempt(
             if STRATEGIC_MODE == "C":
                 # ── 策略 C + burst：等到 T + TOKEN_FETCH_DELAY_MS 取一次 token，复用给所有线程 ──
                 fetch_dt = target_dt + datetime.timedelta(milliseconds=TOKEN_FETCH_DELAY_MS)
-                while _beijing_now() < fetch_dt:
-                    time.sleep(0.001)
+                _wait_until(fetch_dt)
                 logging.info(
                     f"[strategic] [burst-C] Fetching single reusable token at {_beijing_now()} "
                     f"(target_dt + {TOKEN_FETCH_DELAY_MS}ms) from {_first_token_url}"
@@ -898,8 +924,7 @@ def strategic_first_attempt(
                         f"[strategic] [burst-A] Waiting until target_dt - {PRE_FETCH_TOKEN_MS}ms "
                         f"({burst_prefetch_dt}) to pre-fetch token"
                     )
-                    while _beijing_now() < burst_prefetch_dt:
-                        time.sleep(0.05)
+                    _wait_until(burst_prefetch_dt)
 
                 logging.info(
                     f"[strategic] [burst-A] Pre-fetching 1 shared token at {_beijing_now()} from {_first_token_url}"
@@ -993,8 +1018,7 @@ def strategic_first_attempt(
                 # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
                 #         目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒提交
                 pre_fetch_dt = target_dt - datetime.timedelta(milliseconds=PRE_FETCH_TOKEN_MS)
-                while _beijing_now() < pre_fetch_dt:
-                    time.sleep(0.1)
+                _wait_until(pre_fetch_dt)
                 logging.info(
                     f"[strategic] [A] Pre-fetch page token at {_beijing_now()} "
                     f"(target_dt - {PRE_FETCH_TOKEN_MS}ms) from {_first_token_url}"
@@ -1012,8 +1036,7 @@ def strategic_first_attempt(
                 )
 
                 submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
-                while _beijing_now() < submit_dt1:
-                    time.sleep(0.001)
+                _wait_until(submit_dt1)
                 logging.info(
                     f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
@@ -1031,8 +1054,7 @@ def strategic_first_attempt(
             else:
                 # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
                 token_fetch_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
-                while _beijing_now() < token_fetch_dt1:
-                    time.sleep(0.001)
+                _wait_until(token_fetch_dt1)
                 logging.info(
                     f"[strategic] [B] Fetch page token at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
@@ -1081,8 +1103,7 @@ def strategic_first_attempt(
                     logging.error("[strategic] Failed to get page token for second submit, skip to third/normal flow")
                 else:
                     send_dt2 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET2_MS)
-                    while _beijing_now() < send_dt2:
-                        time.sleep(0.02)
+                    _wait_until(send_dt2)
                     logging.info(
                         f"[strategic] Second submit at {send_dt2} (now + {TARGET_OFFSET2_MS}ms) with NEW page token"
                     )
@@ -1115,8 +1136,7 @@ def strategic_first_attempt(
                     logging.error("[strategic] Failed to get page token for third submit, give up strategic submits for this config")
                 else:
                     send_dt3 = _beijing_now() + datetime.timedelta(milliseconds=TARGET_OFFSET3_MS)
-                    while _beijing_now() < send_dt3:
-                        time.sleep(0.02)
+                    _wait_until(send_dt3)
                     logging.info(
                         f"[strategic] Third submit at {send_dt3} (now + {TARGET_OFFSET3_MS}ms) with NEW page token"
                     )
