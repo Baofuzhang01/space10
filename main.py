@@ -82,6 +82,7 @@ from utils import AES_Decrypt, reserve, get_user_credentials
 from utils.reserve import CredentialRejectedError
 from utils.time_utils import (
     infer_use_custom_day,
+    normalize_day_offset,
     parse_times_range,
     resolve_request_day,
 )
@@ -149,6 +150,7 @@ ENDTIME = "23:22:40"  # 根据学校的预约座位时间+40ms即可
 WARM_CONNECTION_LEAD_MS = 2500  # 连接预热提前量（毫秒）
 FIRST_TOKEN_DATE_MODE = "today"  # 首次取 token 的日期：today 或 submit_date
 RESERVE_NEXT_DAY = True  # 预约明天而不是今天的
+RESERVE_DAY_OFFSET = None  # 可选：覆盖提交参数 day 的北京时间日期偏移，2 表示后天
 ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（需要图灵云打码平台）
 SEAT_API_MODE = "seat"  # 选座接口模式：auto / seatengine / seat
@@ -233,6 +235,7 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "endtime": payload.get("endtime", ENDTIME),
             "seat_api_mode": payload.get("seat_api_mode", SEAT_API_MODE),
             "reserve_next_day": payload.get("reserve_next_day", RESERVE_NEXT_DAY),
+            "reserve_day_offset": payload.get("reserve_day_offset"),
             "enable_slider": payload.get("enable_slider", ENABLE_SLIDER),
             "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
             "relogin_every_loop": False,
@@ -260,10 +263,12 @@ def _apply_strategy_config(config):
     global WARM_CONNECTION_LEAD_MS
     global FIRST_TOKEN_DATE_MODE
     global SEAT_API_MODE
+    global RESERVE_DAY_OFFSET
 
     strategy_cfg = config.get("strategy", {})
     ENDTIME = config.get("endtime", ENDTIME)
     RESERVE_NEXT_DAY = bool(config.get("reserve_next_day", RESERVE_NEXT_DAY))
+    RESERVE_DAY_OFFSET = normalize_day_offset(config.get("reserve_day_offset", None))
     ENABLE_SLIDER = bool(config.get("enable_slider", ENABLE_SLIDER))
     ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
     seat_api_mode = str(config.get("seat_api_mode", SEAT_API_MODE)).strip().lower()
@@ -426,6 +431,13 @@ def _burst_shot_worker(
         f"[burst] Shot {index + 1} firing at {_beijing_now()} (target_dt + {offset_ms}ms)"
     )
 
+    if (ENABLE_SLIDER or ENABLE_TEXTCLICK) and not captcha:
+        logging.error(
+            f"[burst] Shot {index + 1} has empty captcha, skip submit to avoid empty captcha"
+        )
+        results[index] = False
+        return
+
     if pre_token:
         token, value = pre_token, pre_value
         logging.info(
@@ -553,8 +565,9 @@ def strategic_first_attempt(
             times,
             RESERVE_NEXT_DAY,
             use_custom_day=use_custom_day,
+            reserve_day_offset=RESERVE_DAY_OFFSET,
         )
-        warm_day = submit_day if use_custom_day else str(_beijing_now().date())
+        warm_day = str(_beijing_now().date())
         first_token_day = submit_day
         if not use_custom_day:
             first_token_day = str(
@@ -573,6 +586,7 @@ def strategic_first_attempt(
                 enable_slider=ENABLE_SLIDER,
                 enable_textclick=ENABLE_TEXTCLICK,
                 reserve_next_day=RESERVE_NEXT_DAY,
+                reserve_day_offset=RESERVE_DAY_OFFSET,
             )
             login_deadline = _get_strategy_login_deadline(target_dt)
             login_ok = False
@@ -640,6 +654,7 @@ def strategic_first_attempt(
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
                         reserve_next_day=RESERVE_NEXT_DAY,
+                        reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
                     worker.requests.cookies.update(s.requests.cookies)
                     worker.requests.headers.update(s.requests.headers)
@@ -743,6 +758,7 @@ def strategic_first_attempt(
                             enable_slider=ENABLE_SLIDER,
                             enable_textclick=ENABLE_TEXTCLICK,
                             reserve_next_day=RESERVE_NEXT_DAY,
+                            reserve_day_offset=RESERVE_DAY_OFFSET,
                         )
                         worker.requests.cookies.update(s.requests.cookies)
                         worker.requests.headers.update(s.requests.headers)
@@ -865,12 +881,71 @@ def strategic_first_attempt(
                 captcha2 = s.resolve_captcha("textclick") or ""
                 captcha3 = s.resolve_captcha("textclick") or ""
 
+        captcha_required = bool(ENABLE_SLIDER or ENABLE_TEXTCLICK)
+        captcha_type = "slide" if ENABLE_SLIDER else "textclick"
+        raw_captchas = [captcha1, captcha2, captcha3]
+        allow_on_demand_captcha = captcha_required and not any(raw_captchas)
+        captchas_for_submit = [captcha for captcha in raw_captchas if captcha]
+        if captcha_required and captchas_for_submit != raw_captchas:
+            logging.warning(
+                "[strategic] Normalize captcha submit order to avoid empty captcha: "
+                f"raw={raw_captchas}, non_empty_count={len(captchas_for_submit)}"
+            )
+        captchas_for_submit = (captchas_for_submit + ["", "", ""])[:3]
+        captcha1, captcha2, captcha3 = captchas_for_submit
+        if captcha_required:
+            logging.info(
+                "[strategic] Captcha submit order after normalization: "
+                f"captcha1={captcha1}, captcha2={captcha2}, captcha3={captcha3}"
+            )
+
+        def _get_submit_captcha(shot_idx: int) -> str | None:
+            if not captcha_required:
+                return ""
+
+            list_idx = shot_idx - 1
+            captcha = (
+                captchas_for_submit[list_idx]
+                if 0 <= list_idx < len(captchas_for_submit)
+                else ""
+            )
+            if captcha:
+                return captcha
+
+            if not allow_on_demand_captcha:
+                logging.error(
+                    f"[strategic] Captcha for submit shot {shot_idx} is empty, "
+                    "but at least one pre-resolved captcha exists; skip submit to avoid empty captcha"
+                )
+                return None
+
+            logging.warning(
+                f"[strategic] Captcha for submit shot {shot_idx} is empty, "
+                f"all pre-resolved captchas are empty, resolve {captcha_type} captcha on demand before submit"
+            )
+            captcha = s.resolve_captcha(captcha_type) or ""
+            if captcha:
+                if 0 <= list_idx < len(captchas_for_submit):
+                    captchas_for_submit[list_idx] = captcha
+                logging.info(
+                    f"[strategic] On-demand {captcha_type} captcha for submit shot "
+                    f"{shot_idx}: {captcha}"
+                )
+                return captcha
+
+            logging.error(
+                f"[strategic] Submit shot {shot_idx} has no captcha after on-demand "
+                "resolve, skip submit to avoid empty captcha"
+            )
+            return None
+
         # 将已登录的 session 存入 sessions[]，fallback 直接复用，无需重新登录
         if sessions is not None and sessions[index] is None:
             sessions[index] = s
 
-        # 自定义日期模式下，预热 / token / submit 一律使用最终提交日；
-        # 普通时间段则保留原有 warm_day / first_token_date_mode 逻辑。
+        # 连接预热始终使用当天页面；
+        # 自定义日期模式下，首次 token / submit 使用最终提交日；
+        # 普通时间段则保留原有 first_token_date_mode 逻辑。
         _warm_url = s.url.format(
             roomId=roomid,
             day=warm_day,
@@ -904,7 +979,9 @@ def strategic_first_attempt(
         if SUBMIT_MODE == "burst":
             # ── 定时连发（极限型）──
             n_shots = len(BURST_OFFSETS_MS)
-            captchas_list = [captcha1, captcha2, captcha3]
+            captchas_list = (
+                captchas_for_submit + [""] * max(0, n_shots - len(captchas_for_submit))
+            )[:n_shots]
 
             if STRATEGIC_MODE == "C":
                 # ── 策略 C + burst：等到 T + TOKEN_FETCH_DELAY_MS 取一次 token，复用给所有线程 ──
@@ -1009,17 +1086,21 @@ def strategic_first_attempt(
                     logging.error("[strategic] [C] Token fetch failed, skip this config")
                     continue
                 logging.info(f"[strategic] [C] Got token from {_first_token_url}: {token1}, immediately submit")
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
-                    use_custom_day=use_custom_day,
-                )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=roomid,
+                        seatid=first_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        use_custom_day=use_custom_day,
+                    )
 
             elif STRATEGIC_MODE == "A":
                 # 策略 A：目标时间前 PRE_FETCH_TOKEN_MS 毫秒预取 token，
@@ -1047,17 +1128,21 @@ def strategic_first_attempt(
                 logging.info(
                     f"[strategic] [A] First submit at {_beijing_now()} (target_dt + {FIRST_SUBMIT_OFFSET_MS}ms)"
                 )
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
-                    use_custom_day=use_custom_day,
-                )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=roomid,
+                        seatid=first_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        use_custom_day=use_custom_day,
+                    )
 
             else:
                 # 策略 B：目标时间后 FIRST_SUBMIT_OFFSET_MS 毫秒获取 token 并立即提交
@@ -1082,17 +1167,21 @@ def strategic_first_attempt(
                     f"{token1}, value: {value1}"
                 )
                 logging.info(f"[strategic] [B] Immediately submit after fetching page token")
-                suc = s.get_submit(
-                    url=s.submit_url,
-                    times=times,
-                    token=token1,
-                    roomid=roomid,
-                    seatid=first_seat,
-                    captcha=captcha1,
-                    action=action,
-                    value=value1,
-                    use_custom_day=use_custom_day,
-                )
+                submit_captcha1 = _get_submit_captcha(1)
+                if submit_captcha1 is None:
+                    suc = False
+                else:
+                    suc = s.get_submit(
+                        url=s.submit_url,
+                        times=times,
+                        token=token1,
+                        roomid=roomid,
+                        seatid=first_seat,
+                        captcha=submit_captcha1,
+                        action=action,
+                        value=value1,
+                        use_custom_day=use_custom_day,
+                    )
 
             # 如果第一次没有成功：重新获取页面 token，获取后立即提交第二枪
             if not suc:
@@ -1129,17 +1218,21 @@ def strategic_first_attempt(
                     logging.info(
                         "[strategic] Second submit immediately after fetching NEW page token"
                     )
-                    suc = s.get_submit(
-                        url=s.submit_url,
-                        times=times,
-                        token=token2,
-                        roomid=roomid,
-                        seatid=first_seat,
-                        captcha=captcha2,
-                        action=action,
-                        value=value2,
-                        use_custom_day=use_custom_day,
-                    )
+                    submit_captcha2 = _get_submit_captcha(2)
+                    if submit_captcha2 is None:
+                        suc = False
+                    else:
+                        suc = s.get_submit(
+                            url=s.submit_url,
+                            times=times,
+                            token=token2,
+                            roomid=roomid,
+                            seatid=first_seat,
+                            captcha=submit_captcha2,
+                            action=action,
+                            value=value2,
+                            use_custom_day=use_custom_day,
+                        )
 
             # 如果第二次仍未成功：重新获取页面 token，获取后立即提交第三枪
             if not suc:
@@ -1161,17 +1254,21 @@ def strategic_first_attempt(
                     logging.info(
                         "[strategic] Third submit immediately after fetching NEW page token"
                     )
-                    suc = s.get_submit(
-                        url=s.submit_url,
-                        times=times,
-                        token=token3,
-                        roomid=roomid,
-                        seatid=first_seat,
-                        captcha=captcha3,
-                        action=action,
-                        value=value3,
-                        use_custom_day=use_custom_day,
-                    )
+                    submit_captcha3 = _get_submit_captcha(3)
+                    if submit_captcha3 is None:
+                        suc = False
+                    else:
+                        suc = s.get_submit(
+                            url=s.submit_url,
+                            times=times,
+                            token=token3,
+                            roomid=roomid,
+                            seatid=first_seat,
+                            captcha=submit_captcha3,
+                            action=action,
+                            value=value3,
+                            use_custom_day=use_custom_day,
+                        )
 
         success_list[index] = suc
 
@@ -1250,6 +1347,7 @@ def login_and_reserve(
                         enable_slider=ENABLE_SLIDER,
                         enable_textclick=ENABLE_TEXTCLICK,
                         reserve_next_day=RESERVE_NEXT_DAY,
+                        reserve_day_offset=RESERVE_DAY_OFFSET,
                     )
                     if not s.bootstrap_login(username, password):
                         logging.warning(
@@ -1268,6 +1366,7 @@ def login_and_reserve(
                     enable_slider=ENABLE_SLIDER,
                     enable_textclick=ENABLE_TEXTCLICK,
                     reserve_next_day=RESERVE_NEXT_DAY,
+                    reserve_day_offset=RESERVE_DAY_OFFSET,
                 )
                 if not s.bootstrap_login(username, password):
                     logging.warning(
@@ -1501,6 +1600,7 @@ def debug(users, action=False):
             enable_slider=ENABLE_SLIDER,
             enable_textclick=ENABLE_TEXTCLICK,
             reserve_next_day=RESERVE_NEXT_DAY,
+            reserve_day_offset=RESERVE_DAY_OFFSET,
         )
         if not s.bootstrap_login(username, password):
             logging.warning(f"Skip debug reserve attempt for {username}: login bootstrap failed")
@@ -1528,6 +1628,7 @@ def get_roomid(args1, args2):
         enable_slider=ENABLE_SLIDER,
         enable_textclick=ENABLE_TEXTCLICK,
         reserve_next_day=RESERVE_NEXT_DAY,
+        reserve_day_offset=RESERVE_DAY_OFFSET,
     )
     if not s.bootstrap_login(username=username, password=password):
         logging.error("Failed to bootstrap login session, abort room query")

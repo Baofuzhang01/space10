@@ -136,6 +136,7 @@ class reserve:
         enable_slider=False,
         enable_textclick=False,
         reserve_next_day=False,
+        reserve_day_offset=None,
     ):
         self.login_page = (
             "https://passport2.chaoxing.com/mlogin?loginType=1&newversion=true&fid="
@@ -218,6 +219,7 @@ class reserve:
         self.enable_slider = enable_slider
         self.enable_textclick = enable_textclick
         self.reserve_next_day = reserve_next_day
+        self.reserve_day_offset = reserve_day_offset
         self._captcha_context = {}
         self._connection_trace_context = None
         self._warm_request_trace = {}
@@ -1126,6 +1128,19 @@ class reserve:
             
             logging.info(f"Parsed target characters: {target_chars}")
             
+            recognized_chars = [char for char in str(recognized_text) if char.strip()]
+            normalized_coordinates = []
+            for idx, coord in enumerate(coordinates):
+                if not isinstance(coord, dict):
+                    continue
+                normalized_coord = dict(coord)
+                if not normalized_coord.get("text") and idx < len(recognized_chars):
+                    normalized_coord["text"] = recognized_chars[idx]
+                normalized_coordinates.append(normalized_coord)
+
+            coordinates = normalized_coordinates
+            logging.info(f"Normalized OCR coordinates: {coordinates}")
+
             result_positions = []
             used_indices = set()
             
@@ -1318,6 +1333,7 @@ class reserve:
             normalized_times,
             self.reserve_next_day,
             use_custom_day=use_custom_day,
+            reserve_day_offset=self.reserve_day_offset,
         )
         parm = {
             "roomId": roomid,
@@ -1367,6 +1383,7 @@ class reserve:
             normalized_times,
             self.reserve_next_day,
             use_custom_day=use_custom_day,
+            reserve_day_offset=self.reserve_day_offset,
         )
         
         # 每次调用 submit 时重置 max_attempt，确保每个配置都有充足的重试机会

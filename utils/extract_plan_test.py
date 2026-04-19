@@ -1,16 +1,25 @@
 import re
 
+MAX_HOURS_PER_OBJECT = 16
+
 TEST_TEXT = """
-自习室id：13501
-座位号:314
+自习室id:5559
+座位号:076
 时间段:
-周一:8:00-22:00
-周二:8:00-22:00
-周三:8:00-22:00
-周四:8:00-22:00
-周五:8:00-22:00
-周六:8:00-22:00
-周日:8:00-22:00
+周一:
+8:00-13.00,13.00-18.00,18.00-22.00
+周二:
+8:00-13.00,13.00-18.00,18.00-22.00
+周三:
+10.00-15.00,15.00-18.00,18.00-22.00
+周四:
+8:00-13.00,13.00-18.00,18.00-22.00
+周五:
+13.00-18.00,18.00-22.00
+周六:
+13.00-18.00,18.00-22.00
+周日:
+8:00-13.00,13.00-18.00,18.00-22.00
 """.strip()
 
 
@@ -54,16 +63,19 @@ def extract_plan(text):
     }
     all_days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
 
-    # 支持多行时间段输入，跳过空行，兼容中英文冒号
-    # 兼容全角冒号“∶”
-    pattern = r"(周[一二三四五六日天])\s*[:：∶]\s*(\d{1,2}[:：∶]\d{2})\s*-\s*(\d{1,2}[:：∶]\d{2})"
-    everyday_pattern = r"每天\s*[：=∶]\s*(\d{1,2}[:：∶]\d{2})\s*-\s*(\d{1,2}[:：∶]\d{2})"
+    # 支持多行时间段输入，兼容：
+    # 周一:8:00-12:00
+    # 周一:8:00-12:00，14:00-16:00
+    # 每天:8:00-12:00,14:00-16:00
+    day_prefix_pattern = r"^(周[一二三四五六日天])\s*[:：∶]?\s*(.*)$"
+    everyday_prefix_pattern = r"^每天\s*[:：=∶]?\s*(.*)$"
+    time_range_pattern = r"(\d{1,2}[:：∶.．。]\d{2})\s*[-~—–至]\s*(\d{1,2}[:：∶.．。]\d{2})"
 
     plans = []
     # 支持时间段在任意位置，整段文本查找
     def pad_time(t):
         # 补零，兼容所有冒号
-        t = t.replace("：", ":").replace("∶", ":")
+        t = t.replace("：", ":").replace("∶", ":").replace(".", ":").replace("．", ":").replace("。", ":")
         parts = t.split(":")
         if len(parts) == 2:
             hour = parts[0].zfill(2)
@@ -71,34 +83,78 @@ def extract_plan(text):
             return f"{hour}:{minute}"
         return t
 
-    for m in re.findall(pattern, text):
-        day_cn, start, end = m
-        day_en = week_map.get(day_cn, day_cn)
-        start = pad_time(start)
-        end = pad_time(end)
-        # 确保seatid为3位数
-        seatid_padded = [s.zfill(3) for s in seatid]
-        plans.append({
-            "times": [start, end],
-            "roomid": roomid,
-            "seatid": seatid_padded,
-            "seatPageId": roomid,
-            "daysofweek": [day_en]
-        })
+    def time_to_minutes(t):
+        hour, minute = pad_time(t).split(":")
+        return int(hour) * 60 + int(minute)
 
-    for m2 in re.findall(everyday_pattern, text):
-        start, end = m2
-        start = pad_time(start)
-        end = pad_time(end)
-        # 确保seatid为3位数
+    def minutes_to_time(total_minutes):
+        hour = total_minutes // 60
+        minute = total_minutes % 60
+        return f"{hour:02d}:{minute:02d}"
+
+    def split_time_range(start, end):
+        start_minutes = time_to_minutes(start)
+        end_minutes = time_to_minutes(end)
+        if end_minutes <= start_minutes:
+            return [(pad_time(start), pad_time(end))]
+
+        max_hours = MAX_HOURS_PER_OBJECT
+        if max_hours is None:
+            return [(pad_time(start), pad_time(end))]
+
+        try:
+            max_minutes = int(float(max_hours) * 60)
+        except (TypeError, ValueError):
+            max_minutes = 0
+
+        if max_minutes <= 0:
+            return [(pad_time(start), pad_time(end))]
+
+        segments = []
+        current = start_minutes
+        while current < end_minutes:
+            next_end = min(current + max_minutes, end_minutes)
+            segments.append((minutes_to_time(current), minutes_to_time(next_end)))
+            current = next_end
+        return segments
+
+    def append_plan(daysofweek, start, end):
         seatid_padded = [s.zfill(3) for s in seatid]
-        plans.append({
-            "times": [start, end],
-            "roomid": roomid,
-            "seatid": seatid_padded,
-            "seatPageId": roomid,
-            "daysofweek": all_days
-        })
+        for segment_start, segment_end in split_time_range(start, end):
+            plans.append({
+                "times": [segment_start, segment_end],
+                "roomid": roomid,
+                "seatid": seatid_padded,
+                "seatPageId": roomid,
+                "daysofweek": daysofweek
+            })
+
+    active_days = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        day_match = re.match(day_prefix_pattern, line)
+        if day_match:
+            day_cn, ranges_text = day_match.groups()
+            day_en = week_map.get(day_cn, day_cn)
+            active_days = [day_en]
+            for start, end in re.findall(time_range_pattern, ranges_text):
+                append_plan([day_en], pad_time(start), pad_time(end))
+            continue
+
+        everyday_match = re.match(everyday_prefix_pattern, line)
+        if everyday_match:
+            ranges_text = everyday_match.group(1)
+            active_days = all_days[:]
+            for start, end in re.findall(time_range_pattern, ranges_text):
+                append_plan(all_days, pad_time(start), pad_time(end))
+            continue
+
+        if active_days:
+            for start, end in re.findall(time_range_pattern, line):
+                append_plan(active_days[:], pad_time(start), pad_time(end))
     return plans
 
 if __name__ == "__main__":

@@ -4,14 +4,14 @@ main = "worker2.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-# 北京时间常规分钟窗口 05:54-21:57，额外补充 21:24-21:27；Cloudflare cron 使用 UTC
-crons = ["54-57 21-23 * * *", "54-57 0-13 * * *", "24-27 13 * * *"]
+# Cloudflare 每分钟唤醒一次，实际检测时间由 worker2 UI 保存到 KV 的北京时间 cron 控制。
+crons = ["* * * * *"]
 
 [vars]
 FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/7cae2f91-8518-4ba1-bf98-dec6054d936c"
 FEISHU_KEYWORD = "检测"
 TRIGGER_API = "https://tongyi.baofuzhang0402.workers.dev/api"
-API_KEY = "depot005q"
+API_KEY = "zqwzqw"
 # tongyi 所在账号与心跳 KV namespace，worker2 通过 Cloudflare KV REST API 跨账号读取
 HEARTBEAT_SOURCE_ACCOUNT_ID = "288006df1270dacb1b639eb6b60ad881"
 HEARTBEAT_SOURCE_NAMESPACE_ID = "855ed3d52d7b47c9bbf76681d69de5b5"

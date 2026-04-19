@@ -21,6 +21,7 @@ QIANDUAN_PORT="${QIANDUAN_PORT:-8090}"
 DISPATCH_PORT="${DISPATCH_PORT:-8788}"
 RUN_INIT_LOCAL_CACHE="${RUN_INIT_LOCAL_CACHE:-1}"
 ENABLE_SYNC_TIMERS="${ENABLE_SYNC_TIMERS:-1}"
+ENABLE_RENEWAL_TIMER="${ENABLE_RENEWAL_TIMER:-1}"
 REMOTE_STAGE_PROJECT_DIR="$REMOTE_STAGE_DIR/project"
 REMOTE_STAGE_ENV_FILE="$REMOTE_STAGE_DIR/seat-qianduan.env"
 
@@ -79,13 +80,13 @@ chmod 700 "$STAGE_DIR"
 
 if command -v apt-get >/dev/null 2>&1; then
   run_root env DEBIAN_FRONTEND=noninteractive apt-get update
-  run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx rsync curl
+  run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv python3-pip nginx rsync curl libgl1 libglib2.0-0
 elif command -v dnf >/dev/null 2>&1; then
-  run_root dnf install -y python3 python3-pip python3-virtualenv nginx rsync curl
+  run_root dnf install -y python3 python3-pip python3-virtualenv nginx rsync curl mesa-libGL glib2
 elif command -v yum >/dev/null 2>&1; then
-  run_root yum install -y python3 python3-pip python3-virtualenv nginx rsync curl
+  run_root yum install -y python3 python3-pip python3-virtualenv nginx rsync curl mesa-libGL glib2
 else
-  echo "Unsupported package manager. Install python3, python3-pip, nginx, rsync, curl manually." >&2
+  echo "Unsupported package manager. Install python3, python3-pip, nginx, rsync, curl, libgl and glib manually." >&2
   exit 1
 fi
 REMOTE_BOOTSTRAP
@@ -100,11 +101,20 @@ rsync -avz --delete \
   --exclude '__MACOSX' \
   --exclude '__pycache__' \
   --exclude '*.pyc' \
+  --exclude 'config.json' \
+  --exclude 'utils/config.json' \
+  --exclude 'seat-qianduan.env.local' \
   --exclude 'html_debug' \
   --exclude 'logs' \
+  --exclude 'pageexe' \
+  --exclude 'pageexe.zip' \
   --exclude 'server_runs' \
+  --exclude 'server_worker2_watchdog' \
   --exclude 'server_store/*.sqlite3' \
   --exclude 'server_store/*.sqlite3-*' \
+  --exclude 'worker2/.wrangler' \
+  --exclude 'workers/tongyi/.wrangler' \
+  --exclude 'workers/tongyi/dist' \
   --exclude 'workers/tongyi/node_modules' \
   --exclude 'worker2/node_modules' \
   -e "$SSH_RSH" \
@@ -132,7 +142,8 @@ ssh -o IdentitiesOnly=yes -i "$SSH_KEY" "$DEPLOY_HOST" \
   "$QIANDUAN_PORT" \
   "$DISPATCH_PORT" \
   "$RUN_INIT_LOCAL_CACHE" \
-  "$ENABLE_SYNC_TIMERS" <<'REMOTE_CONFIG'
+  "$ENABLE_SYNC_TIMERS" \
+  "$ENABLE_RENEWAL_TIMER" <<'REMOTE_CONFIG'
 set -euo pipefail
 
 STAGE_DIR="$1"
@@ -149,6 +160,7 @@ QIANDUAN_PORT="${11}"
 DISPATCH_PORT="${12}"
 RUN_INIT_LOCAL_CACHE="${13}"
 ENABLE_SYNC_TIMERS="${14}"
+ENABLE_RENEWAL_TIMER="${15}"
 
 if [[ "$(id -u)" -eq 0 ]]; then
   SUDO=""
@@ -170,11 +182,20 @@ run_root() {
 run_root install -d -m 755 "$PROJECT_DIR" "$STATIC_DIR" "$PROJECT_DIR/server_runs"
 run_root rsync -av --delete \
   --exclude '.venv' \
+  --exclude 'config.json' \
+  --exclude 'utils/config.json' \
+  --exclude 'seat-qianduan.env.local' \
   --exclude 'html_debug' \
   --exclude 'logs' \
+  --exclude 'pageexe' \
+  --exclude 'pageexe.zip' \
   --exclude 'server_runs' \
+  --exclude 'server_worker2_watchdog' \
   --exclude 'server_store/*.sqlite3' \
   --exclude 'server_store/*.sqlite3-*' \
+  --exclude 'worker2/.wrangler' \
+  --exclude 'workers/tongyi/.wrangler' \
+  --exclude 'workers/tongyi/dist' \
   "$STAGE_PROJECT_DIR/" "$PROJECT_DIR/"
 run_root install -m 600 "$STAGE_ENV_FILE" "$ENV_FILE"
 
@@ -183,12 +204,21 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 
 run_root "$VENV_DIR/bin/pip" install --upgrade pip setuptools wheel
+run_root "$VENV_DIR/bin/pip" uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless cv2 >/dev/null 2>&1 || true
 run_root "$VENV_DIR/bin/pip" install -r "$PROJECT_DIR/requirements.txt"
 
 run_root "$VENV_DIR/bin/python" -m py_compile \
   "$PROJECT_DIR/main.py" \
   "$PROJECT_DIR/server_dispatch.py" \
-  "$PROJECT_DIR/qianduan/server_api_example.py"
+  "$PROJECT_DIR/qianduan/server_api_example.py" \
+  "$PROJECT_DIR/server_store/repository.py" \
+  "$PROJECT_DIR/server_store/renewal_scan.py"
+run_root "$VENV_DIR/bin/python" - <<'PY'
+import cv2
+if not hasattr(cv2, "imdecode"):
+    raise SystemExit("cv2.imdecode missing after dependency install")
+print("cv2 ok", getattr(cv2, "__version__", "unknown"))
+PY
 
 run_root tee "/etc/systemd/system/$SEAT_SERVICE" >/dev/null <<EOF
 [Unit]
@@ -277,6 +307,32 @@ Unit=seat-sync-pull.service
 WantedBy=timers.target
 EOF
 
+run_root tee /etc/systemd/system/seat-renewal-scan.service >/dev/null <<EOF
+[Unit]
+Description=Seat renewal daily scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PROJECT_DIR
+EnvironmentFile=$ENV_FILE
+ExecStart=$VENV_DIR/bin/python $PROJECT_DIR/server_store/renewal_scan.py
+EOF
+
+run_root tee /etc/systemd/system/seat-renewal-scan.timer >/dev/null <<EOF
+[Unit]
+Description=Run Seat Renewal Daily Scan At 23:00
+
+[Timer]
+OnCalendar=*-*-* 23:00:00
+Persistent=true
+Unit=seat-renewal-scan.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 run_root tee /etc/nginx/conf.d/seat.conf >/dev/null <<EOF
 server {
     listen 80;
@@ -317,9 +373,14 @@ EOF
 
 run_root rsync -av --delete \
   --include 'index.html' \
+  --include 'Renewal.html' \
   --include 'app.js' \
   --include 'admin.html' \
   --include 'admin.js' \
+  --include 'seat.html' \
+  --include 'seat.js' \
+  --include 'renewal.js' \
+  --include 'time-config-guide.docx' \
   --include 'styles.css' \
   --exclude '*' \
   "$PROJECT_DIR/qianduan/" "$STATIC_DIR/"
@@ -336,6 +397,10 @@ run_root systemctl enable --now "$DISPATCH_SERVICE"
 if [[ "$ENABLE_SYNC_TIMERS" == "1" ]]; then
   run_root systemctl enable --now seat-sync-push.timer
   run_root systemctl enable --now seat-sync-pull.timer
+fi
+
+if [[ "$ENABLE_RENEWAL_TIMER" == "1" ]]; then
+  run_root systemctl enable --now seat-renewal-scan.timer
 fi
 
 run_root nginx -t

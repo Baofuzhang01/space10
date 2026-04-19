@@ -56,11 +56,34 @@ def infer_use_custom_day(times, use_custom_day=False) -> bool:
     return bool(use_custom_day) or is_custom_day_times(times)
 
 
-def resolve_request_day(times, reserve_next_day, use_custom_day=False) -> str:
+def normalize_day_offset(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        offset = int(text)
+    except (TypeError, ValueError):
+        return None
+    return max(0, offset)
+
+
+def resolve_request_day(
+    times,
+    reserve_next_day,
+    use_custom_day=False,
+    reserve_day_offset=None,
+) -> str:
     start, _ = parse_times_range(times)
     if bool(use_custom_day) and is_date_text(start):
         return start
-    return get_beijing_date(1 if reserve_next_day else 0)
+    day_offset = normalize_day_offset(reserve_day_offset)
+    if day_offset is None:
+        day_offset = 1 if reserve_next_day else 0
+    return get_beijing_date(day_offset)
 
 
 def _augment_user_like_custom_day(payload: dict) -> dict:

@@ -101,6 +101,61 @@ function normalizeSecretText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeEndtimeHms(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return "";
+
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const second = parseInt(match[3] || "0", 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    return "";
+  }
+
+  return [
+    String(hour).padStart(2, "0"),
+    String(minute).padStart(2, "0"),
+    String(second).padStart(2, "0"),
+  ].join(":");
+}
+
+const FORMAL_TIME_WINDOW_LIMIT_SECONDS = 30 * 60;
+
+function parseTriggerTimeSeconds(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 3600 + minute * 60;
+}
+
+function parseEndtimeSeconds(value) {
+  const normalized = normalizeEndtimeHms(value);
+  if (!normalized) return null;
+
+  const [hour, minute, second] = normalized.split(":").map(v => parseInt(v, 10));
+  return hour * 3600 + minute * 60 + second;
+}
+
+function validateFormalTimeWindow(triggerTime, endtime) {
+  const startSeconds = parseTriggerTimeSeconds(triggerTime);
+  if (startSeconds === null) return "正式开始时间格式应为 HH:MM";
+
+  const endSeconds = parseEndtimeSeconds(endtime);
+  if (endSeconds === null) return "正式截止时间格式应为 HH:MM:SS";
+
+  const durationSeconds = endSeconds - startSeconds;
+  if (durationSeconds <= 0) return "正式截止时间必须晚于正式开始时间";
+  if (durationSeconds > FORMAL_TIME_WINDOW_LIMIT_SECONDS) {
+    return "正式开始时间和截止时间间隔不能超过 30 分钟";
+  }
+  return "";
+}
+
 function parseTriggerTimeMinutes(value) {
   const text = String(value || "").trim();
   const match = text.match(/^(\d{1,2}):(\d{2})$/);
@@ -171,14 +226,90 @@ function resolveDispatchTarget(school = null) {
   return ["github", "server_relay", "both"].includes(raw) ? raw : "github";
 }
 
+function parseReserveDayOffset(value) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  if (!/^-?\d+$/.test(text)) return null;
+  const offset = parseInt(text, 10);
+  if (Number.isNaN(offset)) return null;
+  return Math.max(0, offset);
+}
+
+function resolveReserveDayOffset(env, school = null) {
+  const dispatchTarget = resolveDispatchTarget(school);
+  if (dispatchTarget !== "server_relay") return null;
+
+  const directOffset = parseReserveDayOffset(school?.reserve_day_offset);
+  if (directOffset !== null) return directOffset;
+
+  const rawMap = normalizeSecretText(
+    env?.SCHOOL_RESERVE_DAY_OFFSETS || env?.RESERVE_DAY_OFFSETS
+  );
+  if (!rawMap || !school) return null;
+
+  try {
+    const parsed = JSON.parse(rawMap);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const candidates = [school.id, school.name].map(v => String(v || "").trim()).filter(Boolean);
+      for (const key of candidates) {
+        const offset = parseReserveDayOffset(parsed[key]);
+        if (offset !== null) return offset;
+      }
+    }
+  } catch (_) {
+    for (const item of rawMap.split(",")) {
+      const [key, value] = item.split(/[:=]/, 2).map(v => String(v || "").trim());
+      if (!key || key !== String(school.id || "").trim()) continue;
+      const offset = parseReserveDayOffset(value);
+      if (offset !== null) return offset;
+    }
+  }
+
+  return null;
+}
+
+const TEST_ENDTIME_OVERRIDE_TTL_MS = 3 * 60 * 1000;
+
+function getActiveTestEndtimeOverride(school, nowMs = Date.now()) {
+  const override = school?.test_endtime_override;
+  if (!override || typeof override !== "object") return null;
+
+  const endtime = normalizeEndtimeHms(override.endtime);
+  const expiresMs = Date.parse(override.expires_at || "");
+  if (!endtime || !Number.isFinite(expiresMs) || expiresMs <= nowMs) return null;
+
+  return {
+    endtime,
+    enabled_at: override.enabled_at || "",
+    expires_at: new Date(expiresMs).toISOString(),
+    remaining_seconds: Math.max(0, Math.ceil((expiresMs - nowMs) / 1000)),
+  };
+}
+
+function resolveEffectiveEndtime(school, options = {}) {
+  const allowTestEndtimeOverride = options.allowTestEndtimeOverride !== false;
+  const activeOverride = allowTestEndtimeOverride
+    ? getActiveTestEndtimeOverride(school)
+    : null;
+  return activeOverride?.endtime || normalizeEndtimeHms(school?.endtime) || "20:00:40";
+}
+
 function sanitizeSchoolForClient(school) {
   if (!school || typeof school !== "object") return school;
   const hasGitHubToken = !!normalizeSecretText(school.github_token);
   const hasServerApiKey = !!normalizeSecretText(school.server_api_key);
   const tokenKey = normalizeSecretText(school.github_token_key).toLowerCase();
-  const { github_token, server_api_key, ...rest } = school;
+  const activeTestEndtime = getActiveTestEndtimeOverride(school);
+  const { github_token, server_api_key, test_endtime_override, ...rest } = school;
   return {
     ...rest,
+    test_endtime: normalizeEndtimeHms(school.test_endtime) || "",
+    test_endtime_override_active: !!activeTestEndtime,
+    test_endtime_override_endtime: activeTestEndtime?.endtime || "",
+    test_endtime_override_expires_at: activeTestEndtime?.expires_at || "",
+    test_endtime_remaining_seconds: activeTestEndtime?.remaining_seconds || 0,
+    effective_endtime: resolveEffectiveEndtime(school),
     github_token_key: tokenKey,
     dispatch_target: resolveDispatchTarget(school),
     has_github_token: hasGitHubToken || !!tokenKey,
@@ -420,8 +551,11 @@ function defaultSchool(id, name) {
     conflict_group: "",
     trigger_time: "19:57",
     endtime: "20:00:40",
+    test_endtime: "",
+    test_endtime_override: null,
     seat_api_mode: "seat",
     reserve_next_day: true,
+    reserve_day_offset: null,
     enable_slider: false,
     enable_textclick: false,
     fidEnc: "",
@@ -445,8 +579,6 @@ function defaultSchool(id, name) {
       first_submit_offset_ms: 9,
       token_fetch_delay_ms: 45,
       first_token_date_mode: "submit_date",
-      burst_offsets_ms: [120, 420, 820],
-      burst_jitter_range_ms: [0, 0],
     },
   };
 }
@@ -714,22 +846,22 @@ function randomizeStrategy(base) {
     s.fast_probe_start_range_ms,
     s.fast_probe_start_offset_ms || 14,
   );
-  const burstJitterRange = parseRangeWithFallback(s.burst_jitter_range_ms, 0);
 
   s.fast_probe_start_offset_ms = randIntInclusive(probeStartRange[0], probeStartRange[1]);
-
-  const baseBurst = Array.isArray(s.burst_offsets_ms) ? s.burst_offsets_ms : [120, 420, 820];
-  s.burst_offsets_ms = baseBurst.map(v => {
-    const baseMs = parseInt(v, 10);
-    if (Number.isNaN(baseMs)) return v;
-    const jitter = randIntInclusive(burstJitterRange[0], burstJitterRange[1]);
-    return Math.max(0, baseMs + jitter);
-  });
+  delete s.burst_offsets_ms;
+  delete s.burst_jitter_range_ms;
   return s;
 }
 
-function buildDispatchPayloadForUser(school, user) {
+function buildDispatchPayloadForUser(env, school, user, options = {}) {
   const dispatchTarget = resolveDispatchTarget(school);
+  const reserveDayOffset = resolveReserveDayOffset(env, school);
+  const allowTestEndtimeOverride = options.allowTestEndtimeOverride === true;
+  const activeTestEndtime = allowTestEndtimeOverride
+    ? getActiveTestEndtimeOverride(school)
+    : null;
+  const effectiveEndtime = activeTestEndtime?.endtime
+    || resolveEffectiveEndtime(school, { allowTestEndtimeOverride: false });
   const slots = Array.isArray(user?.slots)
     ? user.slots.map(slot => {
         const nextSlot = { ...slot };
@@ -744,9 +876,11 @@ function buildDispatchPayloadForUser(school, user) {
   return {
     ...user,
     ...(slots ? { slots } : {}),
-    endtime: school.endtime,
+    endtime: effectiveEndtime,
+    endtime_source: activeTestEndtime ? "test_override" : "formal",
     seat_api_mode: school.seat_api_mode || "seat",
     reserve_next_day: school.reserve_next_day !== false,
+    ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
     enable_slider: !!school.enable_slider,
     enable_textclick: !!school.enable_textclick,
     strategy: randomizeStrategy(school.strategy),
@@ -788,7 +922,7 @@ async function buildTodayDispatchUsers(KV, schoolId, school, today, schoolUsers 
   return users;
 }
 
-async function dispatchUsersInBatches(env, school, users) {
+async function dispatchUsersInBatches(env, school, users, options = {}) {
   const dispatchToken = resolveGitHubToken(env, school);
   const dispatchTarget = resolveDispatchTarget(school);
   const needsServerDispatch = dispatchTarget === "server_relay" || dispatchTarget === "both";
@@ -800,6 +934,7 @@ async function dispatchUsersInBatches(env, school, users) {
   );
   const batchSize = dispatchTarget === "server_relay" ? serverMaxConcurrency : BATCH_SIZE;
   const batches = chunkArray(users, batchSize);
+  const reserveDayOffset = resolveReserveDayOffset(env, school);
   let okBatches = 0;
   const dispatchErrors = [];
 
@@ -816,12 +951,15 @@ async function dispatchUsersInBatches(env, school, users) {
     const payload = {
       school_id: school.id,
       school_name: school.name,
-      trigger_date: beijingDate(),
+      ...(dispatchTarget !== "server_relay" ? { trigger_date: beijingDate() } : {}),
       batch_index: i + 1,
       batch_total: batches.length,
       dispatch_target: dispatchTarget,
       server_max_concurrency: serverMaxConcurrency,
-      users: batches[i].map(u => buildDispatchPayloadForUser(school, u)),
+      ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
+      users: batches[i].map(u => buildDispatchPayloadForUser(env, school, u, {
+        allowTestEndtimeOverride: options.allowTestEndtimeOverride === true,
+      })),
       ...(dispatchTarget === "server_relay" ? {
         server_url: serverUrl,
         server_api_key: serverApiKey,
@@ -1159,7 +1297,9 @@ async function handleScheduled(env) {
 
     const users = await buildTodayDispatchUsers(env.SEAT_KV, school.id, school, today);
     if (users.length === 0) continue;
-    const result = await dispatchUsersInBatches(env, school, users);
+    const result = await dispatchUsersInBatches(env, school, users, {
+      allowTestEndtimeOverride: false,
+    });
     if (result.error) {
       console.log(`Scheduled dispatch school ${school.id} failed: ${result.error}`);
     }
@@ -1224,6 +1364,7 @@ async function handleAPI(request, env, path) {
       school.seat_api_mode = normalizeSecretText(body.seat_api_mode).toLowerCase();
     }
     if (body.reserve_next_day !== undefined) school.reserve_next_day = !!body.reserve_next_day;
+    if (body.reserve_day_offset !== undefined) school.reserve_day_offset = parseReserveDayOffset(body.reserve_day_offset);
     if (body.enable_slider !== undefined) school.enable_slider = !!body.enable_slider;
     if (body.enable_textclick !== undefined) school.enable_textclick = !!body.enable_textclick;
     if (body.dispatch_target !== undefined) {
@@ -1238,8 +1379,10 @@ async function handleAPI(request, env, path) {
     if (body.server_max_concurrency !== undefined) {
       school.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 13);
     }
-    if (body.trigger_time) school.trigger_time = body.trigger_time;
-    if (body.endtime) school.endtime = body.endtime;
+    if (body.trigger_time) school.trigger_time = normalizeSecretText(body.trigger_time);
+    if (body.endtime) school.endtime = normalizeEndtimeHms(body.endtime) || normalizeSecretText(body.endtime);
+    const timeWindowError = validateFormalTimeWindow(school.trigger_time, school.endtime);
+    if (timeWindowError) return jsonResp({ error: timeWindowError }, 400);
     if (body.fidEnc !== undefined) school.fidEnc = body.fidEnc;
     await saveSchool(KV, school);
     const schools = await getSchools(KV);
@@ -1285,6 +1428,7 @@ async function handleAPI(request, env, path) {
       body.seat_api_mode = normalizeSecretText(body.seat_api_mode).toLowerCase();
     }
     if (body.reserve_next_day !== undefined) body.reserve_next_day = !!body.reserve_next_day;
+    if (body.reserve_day_offset !== undefined) body.reserve_day_offset = parseReserveDayOffset(body.reserve_day_offset);
     if (body.enable_slider !== undefined) body.enable_slider = !!body.enable_slider;
     if (body.enable_textclick !== undefined) body.enable_textclick = !!body.enable_textclick;
     if (body.dispatch_target !== undefined) {
@@ -1302,7 +1446,17 @@ async function handleAPI(request, env, path) {
     if (body.server_max_concurrency !== undefined) {
       body.server_max_concurrency = Math.max(1, parseInt(body.server_max_concurrency, 10) || 13);
     }
-    Object.assign(school, body, { id: school.id });
+    if (body.trigger_time !== undefined) {
+      body.trigger_time = normalizeSecretText(body.trigger_time);
+    }
+    if (body.endtime !== undefined) {
+      body.endtime = normalizeEndtimeHms(body.endtime) || normalizeSecretText(body.endtime);
+    }
+    const nextSchool = { ...school, ...body, id: school.id };
+    const timeWindowError = validateFormalTimeWindow(nextSchool.trigger_time, nextSchool.endtime);
+    if (timeWindowError) return jsonResp({ error: timeWindowError }, 400);
+
+    Object.assign(school, nextSchool);
     await saveSchool(KV, school);
     return jsonResp({ ok: true, school: sanitizeSchoolForClient(school) });
   }
@@ -1311,6 +1465,42 @@ async function handleAPI(request, env, path) {
   if (method === "DELETE" && schoolMatch) {
     await deleteSchool(KV, schoolMatch[1]);
     return jsonResp({ ok: true });
+  }
+
+  // POST /api/school/:id/test-endtime
+  const testEndtimeMatch = path.match(/^\/api\/school\/([^/]+)\/test-endtime$/);
+  if (method === "POST" && testEndtimeMatch) {
+    const school = await getSchool(KV, testEndtimeMatch[1]);
+    if (!school) return jsonResp({ error: "School not found" }, 404);
+
+    let body = {};
+    try {
+      body = await request.json();
+    } catch (_) {
+      body = {};
+    }
+    const action = normalizeSecretText(body.action || "start").toLowerCase();
+    if (action === "stop" || action === "disable") {
+      school.test_endtime_override = null;
+      await saveSchool(KV, school);
+      return jsonResp({ ok: true, school: sanitizeSchoolForClient(school) });
+    }
+
+    const testEndtime = normalizeEndtimeHms(body.test_endtime || body.endtime || school.test_endtime);
+    if (!testEndtime) {
+      return jsonResp({ error: "测试截止时间格式应为 HH:MM:SS" }, 400);
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + TEST_ENDTIME_OVERRIDE_TTL_MS);
+    school.test_endtime = testEndtime;
+    school.test_endtime_override = {
+      endtime: testEndtime,
+      enabled_at: now.toISOString(),
+      expires_at: expiresAt.toISOString(),
+    };
+    await saveSchool(KV, school);
+    return jsonResp({ ok: true, school: sanitizeSchoolForClient(school) });
   }
 
   // GET /api/school/:id/users
@@ -1492,7 +1682,9 @@ async function handleAPI(request, env, path) {
       }
       return jsonResp({ ok: true, triggeredUsers: 0, okBatches: 0, totalBatches: 0 });
     }
-    const result = await dispatchUsersInBatches(env, school, users);
+    const result = await dispatchUsersInBatches(env, school, users, {
+      allowTestEndtimeOverride: !isScheduledFallback,
+    });
     if (result.error) {
       return jsonResp({
         ok: false,
@@ -1540,11 +1732,13 @@ async function handleAPI(request, env, path) {
       : [{ roomid: daySchedule.roomid, seatid: daySchedule.seatid, times: daySchedule.times, seatPageId: daySchedule.seatPageId || "", fidEnc: daySchedule.fidEnc || "" }];
     const activeSlots = rawSlots.filter(s => s.times && s.roomid);
     if (activeSlots.length === 0) return jsonResp({ error: "No active slots for today" }, 400);
+    const reserveDayOffset = resolveReserveDayOffset(env, school);
     const dispatchUser = {
       username: user.phone || user.username,
       password: user.password,
       remark: user.remark || user.username || user.phone,
       nickname: user.username,
+      ...(reserveDayOffset !== null ? { reserve_day_offset: reserveDayOffset } : {}),
       slots: activeSlots.map(s => ({
         roomid: s.roomid,
         seatid: (s.seatid || "").split(",").map(x => x.trim()).filter(Boolean),
@@ -1553,7 +1747,9 @@ async function handleAPI(request, env, path) {
         fidEnc: school.fidEnc || s.fidEnc || "",
       })),
     };
-    const result = await dispatchUsersInBatches(env, school, [dispatchUser]);
+    const result = await dispatchUsersInBatches(env, school, [dispatchUser], {
+      allowTestEndtimeOverride: true,
+    });
     if (result.error) {
       return jsonResp({
         ok: false,
@@ -1683,6 +1879,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .user-table tr:hover{background:#fafafa}
 .status-active{color:#52c41a}
 .status-paused{color:#faad14}
+.test-override-panel{margin-top:16px;padding-top:16px;border-top:1px solid #f0f0f0}
+.test-override-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:end}
+.test-override-status{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;color:#666;margin-bottom:10px}
+.test-status-pill{display:inline-flex;align-items:center;border-radius:999px;padding:2px 8px;font-size:12px;font-weight:600}
+.test-status-on{background:#f6ffed;color:#389e0d}
+.test-status-off{background:#f5f5f5;color:#777}
+.test-override-note{font-size:12px;color:#777;line-height:1.7;margin-top:8px}
 .modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;overflow-y:auto}
 .modal.show{display:flex;align-items:flex-start;justify-content:center;padding:40px 20px}
 .modal-content{background:#fff;border-radius:12px;width:100%;max-width:800px;max-height:90vh;overflow-y:auto}
@@ -1722,6 +1925,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .zone-right{display:flex;align-items:center;gap:6px}
 .copy-btn{border:none;background:#f0f2f7;color:#4b5563;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
 .copy-btn:hover{background:#e5e9f3}
+.mapping-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.mapping-box{background:#fafafa;border:1px solid #ececec;border-radius:10px;padding:14px}
+.mapping-box h4{font-size:14px;color:#333;margin-bottom:8px}
+.mapping-box textarea,.mapping-box input{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:13px}
+.mapping-box textarea{min-height:220px;resize:vertical}
+.mapping-inline{display:grid;grid-template-columns:140px 1fr;gap:12px;align-items:end;margin-bottom:12px}
+.mapping-user-fields{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px}
+.mapping-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.mapping-note{font-size:12px;color:#777;line-height:1.7;margin-top:10px}
+@media (max-width: 768px){.mapping-inline,.mapping-user-fields{grid-template-columns:1fr}}
+@media (max-width: 768px){.test-override-row{grid-template-columns:1fr}.actions{flex-wrap:wrap}}
 </style>
 </head>
 <body>
@@ -1738,6 +1952,7 @@ let currentView = "login";
 let currentSchool = null;
 let schools = [];
 let users = [];
+let isSavingUser = false;
 const ACTIVE_TODAY_CACHE_TTL_MS = 3000;
 const ACTIVE_TODAY_CACHE_PREFIX = "active_today_count:";
 const DEFAULT_READING_ZONE_GROUPS = [
@@ -1750,6 +1965,171 @@ const DEFAULT_READING_ZONE_GROUPS = [
   { floor: "8 楼", zones: [{ id: "13495", name: "西阅览区" }, { id: "13496", name: "中阅览室" }, { id: "13498", name: "东阅览区" }, { id: "13501", name: "电子西阅览区" }, { id: "13503", name: "电子东阅览区" }] },
   { floor: "9 楼", zones: [{ id: "13491", name: "西阅览室" }, { id: "13488", name: "中阅览区" }, { id: "13483", name: "东阅览区" }] },
 ];
+const PLAN_EXTRACT_MAX_HOURS_DEFAULT = 16;
+const PLAN_EXTRACT_WEEK_MAP = {
+  "周一": "Monday",
+  "周二": "Tuesday",
+  "周三": "Wednesday",
+  "周四": "Thursday",
+  "周五": "Friday",
+  "周六": "Saturday",
+  "周日": "Sunday",
+  "周天": "Sunday",
+};
+const PLAN_EXTRACT_ALL_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+const CLIENT_DATE_TEXT_RE = /^\\d{4}-\\d{2}-\\d{2}$/;
+const CLIENT_DATE_PAIR_TEXT_RE = /^\\s*(\\d{4}-\\d{2}-\\d{2})\\s*[,，]\\s*(\\d{4}-\\d{2}-\\d{2})\\s*$/;
+
+function parseTimesInput(rawTimes) {
+  if (Array.isArray(rawTimes) && rawTimes.length >= 2) {
+    return [
+      String(rawTimes[0] || "").trim(),
+      String(rawTimes[1] || "").trim(),
+    ];
+  }
+  const text = String(rawTimes || "").trim();
+  if (!text) return ["", ""];
+
+  const datePairMatch = text.match(CLIENT_DATE_PAIR_TEXT_RE);
+  if (datePairMatch) {
+    return [datePairMatch[1], datePairMatch[2]];
+  }
+
+  const parts = text.split(/-|~|至/).map(s => s.trim()).filter(Boolean);
+  if (parts.length >= 2) {
+    return [parts[0], parts[1]];
+  }
+  return [text, ""];
+}
+
+function isCustomDayTimes(rawTimes) {
+  const [start, end] = parseTimesInput(rawTimes);
+  return CLIENT_DATE_TEXT_RE.test(start) && CLIENT_DATE_TEXT_RE.test(end);
+}
+
+function normalizeTimesLabel(rawTimes) {
+  const [start, end] = parseTimesInput(rawTimes);
+  if (start && end) {
+    return isCustomDayTimes([start, end]) ? \`\${start}，\${end}\` : \`\${start}-\${end}\`;
+  }
+  return String(rawTimes || "").trim();
+}
+
+function isServerRelayTarget(value) {
+  const target = String(value || "").trim().toLowerCase();
+  return target === "server_relay";
+}
+
+function normalizeReserveDayOffsetInput(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!/^\\d+$/.test(text)) return null;
+  return Math.max(0, parseInt(text, 10));
+}
+
+function formatReserveDayLabel(s) {
+  const offset = isServerRelayTarget(s?.dispatch_target)
+    ? normalizeReserveDayOffsetInput(s?.reserve_day_offset)
+    : null;
+  if (offset !== null) {
+    if (offset === 0) return "今天（服务器中转 day+0）";
+    if (offset === 1) return "明天（服务器中转 day+1）";
+    if (offset === 2) return "后天（服务器中转 day+2）";
+    return \`北京时间 +\${offset} 天（服务器中转）\`;
+  }
+  return s?.reserve_next_day === false ? "今天" : "明天";
+}
+
+function normalizeClientEndtimeInput(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\\d{1,2}):(\\d{2})(?::(\\d{2}))?$/);
+  if (!match) return "";
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  const second = parseInt(match[3] || "0", 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+    return "";
+  }
+  return [
+    String(hour).padStart(2, "0"),
+    String(minute).padStart(2, "0"),
+    String(second).padStart(2, "0"),
+  ].join(":");
+}
+
+function parseClientTriggerSeconds(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\\d{1,2}):(\\d{2})$/);
+  if (!match) return null;
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  return hour * 3600 + minute * 60;
+}
+
+function parseClientEndtimeSeconds(value) {
+  const normalized = normalizeClientEndtimeInput(value);
+  if (!normalized) return null;
+  const [hour, minute, second] = normalized.split(":").map(v => parseInt(v, 10));
+  return hour * 3600 + minute * 60 + second;
+}
+
+function validateFormalTimeWindowInput(triggerTime, endtime) {
+  const startSeconds = parseClientTriggerSeconds(triggerTime);
+  if (startSeconds === null) return "正式开始时间格式应为 HH:MM";
+  const endSeconds = parseClientEndtimeSeconds(endtime);
+  if (endSeconds === null) return "正式截止时间格式应为 HH:MM:SS";
+  const durationSeconds = endSeconds - startSeconds;
+  if (durationSeconds <= 0) return "正式截止时间必须晚于正式开始时间";
+  if (durationSeconds > 30 * 60) return "正式开始时间和截止时间间隔不能超过 30 分钟";
+  return "";
+}
+
+function getTestEndtimeState(s) {
+  const overrideEndtime = String(s?.test_endtime_override_endtime || "").trim();
+  const expiresMs = Date.parse(s?.test_endtime_override_expires_at || "");
+  const active = !!overrideEndtime && Number.isFinite(expiresMs) && expiresMs > Date.now();
+  const remainingSeconds = active ? Math.max(0, Math.ceil((expiresMs - Date.now()) / 1000)) : 0;
+  return {
+    active,
+    remainingSeconds,
+    overrideEndtime,
+    effectiveEndtime: active ? overrideEndtime : (s?.endtime || "-"),
+  };
+}
+
+function formatRemainingSeconds(seconds) {
+  const total = Math.max(0, parseInt(seconds, 10) || 0);
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  return \`\${min}分\${String(sec).padStart(2, "0")}秒\`;
+}
+
+function renderTestEndtimePanel(s) {
+  const state = getTestEndtimeState(s);
+  const inputValue = escapeHtml(s?.test_endtime || state.overrideEndtime || "");
+  return \`
+    <div class="test-override-panel">
+      <div class="test-override-status">
+        <strong>测试覆盖:</strong>
+        <span id="test_endtime_status_pill" class="test-status-pill \${state.active ? "test-status-on" : "test-status-off"}">\${state.active ? "开" : "关"}</span>
+        <span id="test_endtime_status_text">\${state.active ? \`当前使用测试截止时间 \${state.overrideEndtime}，剩余 \${formatRemainingSeconds(state.remainingSeconds)}\` : \`当前使用正式截止时间 \${s?.endtime || "-"}\`}</span>
+      </div>
+      <div class="test-override-row">
+        <div class="form-group" style="margin-bottom:0">
+          <label>测试截止时间 (HH:MM:SS)</label>
+          <input type="text" id="school_test_endtime" value="\${inputValue}" placeholder="例如: 20:00:40">
+        </div>
+        <button type="button" class="btn btn-success" onclick="startTestEndtimeOverride()">测试启动</button>
+        <button type="button" class="btn btn-secondary" onclick="stopTestEndtimeOverride()">关闭测试</button>
+      </div>
+      <div class="test-override-note">
+        测试启动后只覆盖当前学校/组的手动触发截止时间；Worker 定时触发仍使用正式截止时间，3 分钟后自动回到正式截止时间。
+      </div>
+    </div>
+  \`;
+}
 
 function getReadingZoneGroups() {
   const groups = currentSchool && Array.isArray(currentSchool.reading_zone_groups)
@@ -1799,6 +2179,207 @@ function normalizeReadingZoneGroups(raw) {
 
 function _emptySlot() {
   return { roomid: "", seatid: "", times: "", seatPageId: "", fidEnc: "" };
+}
+
+function normalizePlanExtractTime(value) {
+  const text = String(value || "").trim().replace(/[：∶.．。]/g, ":");
+  const match = text.match(/^(\\d{1,2}):(\\d{2})$/);
+  if (!match) return text;
+  return \`\${match[1].padStart(2, "0")}:\${match[2].padStart(2, "0")}\`;
+}
+
+function planExtractTimeToMinutes(value) {
+  const normalized = normalizePlanExtractTime(value);
+  const match = normalized.match(/^(\\d{2}):(\\d{2})$/);
+  if (!match) return null;
+  const hour = parseInt(match[1], 10);
+  const minute = parseInt(match[2], 10);
+  if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
+  return hour * 60 + minute;
+}
+
+function planExtractMinutesToTime(totalMinutes) {
+  const hour = Math.floor(totalMinutes / 60);
+  const minute = totalMinutes % 60;
+  return \`\${String(hour).padStart(2, "0")}:\${String(minute).padStart(2, "0")}\`;
+}
+
+function splitPlanExtractTimeRange(start, end, maxHoursPerObject = PLAN_EXTRACT_MAX_HOURS_DEFAULT) {
+  const normalizedStart = normalizePlanExtractTime(start);
+  const normalizedEnd = normalizePlanExtractTime(end);
+  const startMinutes = planExtractTimeToMinutes(normalizedStart);
+  const endMinutes = planExtractTimeToMinutes(normalizedEnd);
+
+  if (startMinutes === null || endMinutes === null || endMinutes <= startMinutes) {
+    return [[normalizedStart, normalizedEnd]];
+  }
+
+  const maxHours = Number(maxHoursPerObject);
+  if (!Number.isFinite(maxHours) || maxHours <= 0) {
+    return [[normalizedStart, normalizedEnd]];
+  }
+
+  const maxMinutes = Math.floor(maxHours * 60);
+  if (maxMinutes <= 0) {
+    return [[normalizedStart, normalizedEnd]];
+  }
+
+  const segments = [];
+  let current = startMinutes;
+  while (current < endMinutes) {
+    const nextEnd = Math.min(current + maxMinutes, endMinutes);
+    segments.push([planExtractMinutesToTime(current), planExtractMinutesToTime(nextEnd)]);
+    current = nextEnd;
+  }
+  return segments;
+}
+
+function extractPlanTextMapping(rawText, options = {}) {
+  const text = String(rawText || "");
+  if (!text.trim()) {
+    throw new Error("请先粘贴计划文本");
+  }
+
+  let roomid = "";
+  let seatid = [];
+  let seatPageId = String(options.seatPageId || "").trim();
+  const fidEnc = String(options.fidEnc || "").trim();
+  const lines = text.split(/\\r?\\n/);
+  const roomPatterns = [
+    /(?:自习室|阅览室|阅览区|房间)\\s*(?:id)?\\s*[：:=]?\\s*(\\d{3,})/i,
+    /(?:roomid|seatpageid)\\s*[：:=]?\\s*(\\d{3,})/i,
+    /(?:自习室|阅览室|阅览区|房间)\\D*(\\d{3,})/i,
+  ];
+  const seatPatterns = [
+    /(?:座位号|座位|seatid|seat)\\s*[：:=]?\\s*([^\\n\\r]+)/i,
+  ];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (!roomid) {
+      for (const pattern of roomPatterns) {
+        const roomMatch = line.match(pattern);
+        if (roomMatch) {
+          roomid = roomMatch[1];
+          break;
+        }
+      }
+    }
+
+    if (!seatPageId) {
+      const seatPageMatch = line.match(/(?:seatpageid|seatPageId|页面id|页id)\\s*[：:=]?\\s*(\\d{3,})/i);
+      if (seatPageMatch) {
+        seatPageId = seatPageMatch[1];
+      }
+    }
+
+    if (!seatid.length) {
+      for (const pattern of seatPatterns) {
+        const seatMatch = line.match(pattern);
+        if (!seatMatch) continue;
+        const nextSeats = String(seatMatch[1] || "").match(/\\d+/g);
+        if (nextSeats && nextSeats.length) {
+          seatid = nextSeats.map(v => String(v).padStart(3, "0"));
+          break;
+        }
+      }
+    }
+  }
+
+  if (!roomid) {
+    for (const pattern of roomPatterns) {
+      const roomMatch = text.match(pattern);
+      if (roomMatch) {
+        roomid = roomMatch[1];
+        break;
+      }
+    }
+  }
+  if (!seatPageId) {
+    const seatPageMatch = text.match(/(?:seatpageid|seatPageId|页面id|页id)\\s*[：:=]?\\s*(\\d{3,})/i);
+    if (seatPageMatch) {
+      seatPageId = seatPageMatch[1];
+    }
+  }
+  if (!seatid.length) {
+    for (const pattern of seatPatterns) {
+      const seatMatch = text.match(pattern);
+      if (!seatMatch) continue;
+      const nextSeats = String(seatMatch[1] || "").match(/\\d+/g);
+      if (nextSeats && nextSeats.length) {
+        seatid = nextSeats.map(v => String(v).padStart(3, "0"));
+        break;
+      }
+    }
+  }
+
+  if (!roomid) {
+    throw new Error("未识别到自习室/阅览区/房间 ID");
+  }
+  if (!seatid.length) {
+    throw new Error("未识别到座位号");
+  }
+  if (!seatPageId) {
+    seatPageId = roomid;
+  }
+
+  const plans = [];
+  const dayPrefixPattern = /^(周[一二三四五六日天])\\s*[:：∶]?\\s*(.*)$/;
+  const everydayPrefixPattern = /^每天\\s*[:：=∶]?\\s*(.*)$/;
+  const timeRangePattern = /(\\d{1,2}[:：∶.．。]\\d{2})\\s*[-~—–至]\\s*(\\d{1,2}[:：∶.．。]\\d{2})/g;
+
+  const appendPlan = (daysofweek, start, end) => {
+    const segments = splitPlanExtractTimeRange(start, end, options.maxHoursPerObject);
+    for (const [segmentStart, segmentEnd] of segments) {
+      plans.push({
+        times: [segmentStart, segmentEnd],
+        roomid,
+        seatid: seatid.slice(),
+        seatPageId,
+        fidEnc,
+        daysofweek,
+      });
+    }
+  };
+
+  let activeDaysofweek = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const dayMatch = line.match(dayPrefixPattern);
+    if (dayMatch) {
+      const dayEn = PLAN_EXTRACT_WEEK_MAP[dayMatch[1]];
+      if (!dayEn) continue;
+      activeDaysofweek = [dayEn];
+      for (const match of dayMatch[2].matchAll(timeRangePattern)) {
+        appendPlan([dayEn], match[1], match[2]);
+      }
+      continue;
+    }
+
+    const everydayMatch = line.match(everydayPrefixPattern);
+    if (everydayMatch) {
+      activeDaysofweek = PLAN_EXTRACT_ALL_DAYS.slice();
+      for (const match of everydayMatch[1].matchAll(timeRangePattern)) {
+        appendPlan(PLAN_EXTRACT_ALL_DAYS.slice(), match[1], match[2]);
+      }
+      continue;
+    }
+
+    if (activeDaysofweek) {
+      for (const match of line.matchAll(timeRangePattern)) {
+        appendPlan(activeDaysofweek.slice(), match[1], match[2]);
+      }
+    }
+  }
+
+  if (!plans.length) {
+    throw new Error("未识别到有效的周计划时间段");
+  }
+  return plans;
 }
 
 function createEmptyWeeklySchedule() {
@@ -1936,6 +2517,73 @@ function applyScheduleJsonToForm() {
   }
 }
 
+function buildPlanMappingFromPanel() {
+  const inputEl = document.getElementById("plan_extract_input");
+  const outputEl = document.getElementById("plan_extract_output");
+  const maxHoursEl = document.getElementById("plan_extract_max_hours");
+  const seatPageIdEl = document.getElementById("plan_extract_seat_page_id");
+  if (!inputEl || !outputEl || !maxHoursEl) {
+    throw new Error("映射面板尚未加载完成");
+  }
+
+  const maxHoursText = String(maxHoursEl.value || "").trim();
+  let maxHours = PLAN_EXTRACT_MAX_HOURS_DEFAULT;
+  if (maxHoursText !== "") {
+    maxHours = Number(maxHoursText);
+    if (!Number.isFinite(maxHours) || maxHours < 0) {
+      throw new Error("最长时段小时数必须是大于等于 0 的数字");
+    }
+  }
+
+  const plans = extractPlanTextMapping(inputEl.value, {
+    maxHoursPerObject: maxHours,
+    seatPageId: String(seatPageIdEl?.value || "").trim(),
+    fidEnc: currentSchool?.fidEnc || "",
+  });
+  const jsonText = JSON.stringify(plans, null, 2);
+  outputEl.value = jsonText;
+  return { plans, jsonText };
+}
+
+function generatePlanMappingJson() {
+  try {
+    buildPlanMappingFromPanel();
+    toast("已生成周计划 JSON");
+  } catch (e) {
+    toast("计划文本映射失败: " + (e.message || String(e)), "error");
+  }
+}
+
+async function copyPlanMappingJson() {
+  const outputEl = document.getElementById("plan_extract_output");
+  if (!outputEl || !String(outputEl.value || "").trim()) {
+    return toast("请先生成周计划 JSON", "error");
+  }
+  await copyTextToClipboard(outputEl.value, "已复制周计划 JSON");
+}
+
+function createMappedUserDraft() {
+  try {
+    const { plans, jsonText } = buildPlanMappingFromPanel();
+    const first = plans[0] || {};
+    const firstSeat = Array.isArray(first.seatid) ? first.seatid.join(",") : "";
+    const phone = String(document.getElementById("plan_extract_phone")?.value || "").trim();
+    const password = String(document.getElementById("plan_extract_password")?.value || "");
+    const username = String(document.getElementById("plan_extract_username")?.value || "").trim();
+    showAddUser({
+      phone,
+      password,
+      username,
+      remark: first.roomid && firstSeat ? \`自动映射 \${first.roomid}/\${firstSeat}\` : "自动映射",
+      scheduleJsonText: jsonText,
+      schedule: parseScheduleJsonMapping(jsonText),
+    });
+    toast("已生成新用户草稿");
+  } catch (e) {
+    toast("生成新用户草稿失败: " + (e.message || String(e)), "error");
+  }
+}
+
 async function api(method, path, body = null) {
   const opts = {
     method,
@@ -1975,6 +2623,14 @@ function toast(msg, type = "success") {
   setTimeout(() => t.remove(), 3000);
 }
 
+function setUserSavePending(pending) {
+  isSavingUser = pending;
+  const btn = document.getElementById("saveUserButton");
+  if (!btn) return;
+  btn.disabled = pending;
+  btn.textContent = pending ? "保存中..." : "保存用户";
+}
+
 function escapeHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
@@ -2004,22 +2660,26 @@ function renderFatalError(error, source = "runtime") {
   \`;
 }
 
-async function copyRoomId(id) {
+async function copyTextToClipboard(text, successMessage = "已复制") {
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(id);
+      await navigator.clipboard.writeText(text);
     } else {
       const input = document.createElement("input");
-      input.value = id;
+      input.value = text;
       document.body.appendChild(input);
       input.select();
       document.execCommand("copy");
       input.remove();
     }
-    toast("已复制 ID: " + id);
+    toast(successMessage);
   } catch (e) {
     toast("复制失败，请手动复制", "error");
   }
+}
+
+async function copyRoomId(id) {
+  await copyTextToClipboard(id, "已复制 ID: " + id);
 }
 
 function render() {
@@ -2032,6 +2692,21 @@ function render() {
     app.innerHTML = renderSchoolDetail();
   }
   bindEvents();
+  updateTestEndtimeStatusView();
+}
+
+function updateTestEndtimeStatusView() {
+  if (currentView !== "school" || !currentSchool) return;
+  const pill = document.getElementById("test_endtime_status_pill");
+  const text = document.getElementById("test_endtime_status_text");
+  if (!pill || !text) return;
+
+  const state = getTestEndtimeState(currentSchool);
+  pill.className = "test-status-pill " + (state.active ? "test-status-on" : "test-status-off");
+  pill.textContent = state.active ? "开" : "关";
+  text.textContent = state.active
+    ? \`当前使用测试截止时间 \${state.overrideEndtime}，剩余 \${formatRemainingSeconds(state.remainingSeconds)}\`
+    : \`当前使用正式截止时间 \${currentSchool.endtime || "-"}\`;
 }
 
 function renderLogin() {
@@ -2198,7 +2873,7 @@ function renderSchools() {
               <div class="stats">
                 <span>\${s.userCount || 0} 名用户</span>
                 <span>\${formatActiveTodayMeta(s.id)}</span>
-                <span>触发时间: \${s.trigger_time}</span>
+                <span>正式开始: \${s.trigger_time}</span>
               </div>
             </div>
           \`).join("") : '<div class="empty"><div class="empty-icon">📚</div><p>暂无学校，点击上方按钮添加</p></div>'}
@@ -2287,17 +2962,21 @@ function renderAddSchoolModal() {
               </div>
             </div>
             <div class="form-group">
+              <label>提交 day 日期偏移（仅服务器中转）</label>
+              <input type="number" id="new_school_reserve_day_offset" min="0" step="1" placeholder="留空沿用预约明天；0 今天，1 明天，2 后天">
+            </div>
+            <div class="form-group">
               <label>服务器 API Key（可留空，优先使用 Worker 环境变量）</label>
               <input type="text" id="new_school_server_api_key" placeholder="留空则回退到 Worker 环境变量 SERVER_DISPATCH_API_KEY">
             </div>
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>触发时间</label>
+              <label>正式开始时间</label>
               <input type="text" id="new_school_trigger" value="19:57" placeholder="HH:MM">
             </div>
             <div class="form-group">
-              <label>截止时间</label>
+              <label>正式截止时间</label>
               <input type="text" id="new_school_endtime" value="20:00:40" placeholder="HH:MM:SS">
             </div>
           </div>
@@ -2336,13 +3015,13 @@ function renderSchoolDetail() {
         </div>
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;font-size:14px">
           <div><strong>学校ID:</strong> \${s.id}</div>
-          <div><strong>触发时间:</strong> \${s.trigger_time}</div>
-          <div><strong>截止时间:</strong> \${s.endtime}</div>
+          <div><strong>正式开始时间:</strong> \${s.trigger_time}</div>
+          <div><strong>正式截止时间:</strong> \${s.endtime}</div>
           <div><strong>GitHub仓库:</strong> \${s.repo}</div>
           <div><strong>今日活跃用户:</strong> \${formatActiveTodayMeta(s.id)}</div>
           <div><strong>GitHub 密匙槽位:</strong> \${s.github_token_key ? s.github_token_key.toUpperCase() : "默认 GH_TOKEN"}</div>
           <div><strong>选座接口:</strong> \${s.seat_api_mode || "seat"}</div>
-          <div><strong>预约日期:</strong> \${s.reserve_next_day === false ? "今天" : "明天"}</div>
+          <div><strong>预约日期:</strong> \${formatReserveDayLabel(s)}</div>
           <div><strong>学校 fidEnc:</strong> \${s.fidEnc || "-"}</div>
           <div><strong>冲突分组:</strong> \${s.conflict_group || (s.fidEnc ? "自动按 fidEnc" : (s.name || "-"))}</div>
           <div><strong>验证码:</strong> \${s.enable_slider ? "滑块" : (s.enable_textclick ? "选字" : "关闭")}</div>
@@ -2353,6 +3032,7 @@ function renderSchoolDetail() {
             <div><strong>服务器密钥:</strong> \${s.has_server_api_key ? "已配置" : "未配置/使用环境变量"}</div>
           \` : ""}
         </div>
+        \${renderTestEndtimePanel(s)}
       </div>
       <div class="card">
         <div class="card-header">
@@ -2412,6 +3092,12 @@ function renderSchoolDetail() {
         </div>
         \${renderReadingZonePanel()}
       </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">计划文本映射</span>
+        </div>
+        \${renderPlanMappingPanel()}
+      </div>
     </div>
     \${renderEditSchoolModal()}
     \${renderUserModal()}
@@ -2438,6 +3124,68 @@ function renderReadingZonePanel() {
           </div>
         </div>
       \`).join("")}
+    </div>
+  \`;
+}
+
+function renderPlanMappingPanel() {
+  return \`
+    <div class="mapping-grid">
+      <div class="mapping-box">
+        <h4>原始计划文本</h4>
+        <div class="mapping-inline">
+          <div>
+            <label>最长单段小时数</label>
+            <input type="number" id="plan_extract_max_hours" min="0" step="0.5" value="\${PLAN_EXTRACT_MAX_HOURS_DEFAULT}">
+          </div>
+          <div class="mapping-note" style="margin-top:0">
+            留空默认 \${PLAN_EXTRACT_MAX_HOURS_DEFAULT} 小时，填 <code>0</code> 表示不拆分超长时间段。
+          </div>
+        </div>
+        <div class="mapping-user-fields">
+          <div>
+            <label>手机号</label>
+            <input type="text" id="plan_extract_phone" placeholder="生成新用户草稿时带入">
+          </div>
+          <div>
+            <label>密码</label>
+            <input type="text" id="plan_extract_password" placeholder="生成新用户草稿时带入">
+          </div>
+          <div>
+            <label>昵称</label>
+            <input type="text" id="plan_extract_username" placeholder="生成新用户草稿时带入">
+          </div>
+          <div>
+            <label>seatPageId</label>
+            <input type="text" id="plan_extract_seat_page_id" placeholder="可选；不填则默认等于 roomid">
+          </div>
+        </div>
+        <textarea id="plan_extract_input" rows="12" placeholder="示例：
+自习室id：13476
+座位号:367
+时间段:
+周一:14:30-22:00
+周二:9:30-22:00
+每天:16:30-22:00">自习室id:</textarea>
+        <div class="mapping-actions">
+          <button type="button" class="btn btn-primary" onclick="generatePlanMappingJson()">生成周计划 JSON</button>
+          <button type="button" class="btn btn-success" onclick="createMappedUserDraft()">一键生成新用户草稿</button>
+        </div>
+        <div class="mapping-note">
+          支持 <code>周一:08:00-12:00，14:00-16:00</code>、<code>周一:</code> 后下一行写时间段，以及 <code>13.00-18.00</code> 这类点号时间。
+          “一键生成新用户草稿”会把上面手动填写的手机号、密码、昵称带入新增用户弹窗，不会覆盖已有用户；真正保存时仍走现有座位冲突校验。
+        </div>
+      </div>
+      <div class="mapping-box">
+        <h4>周计划 JSON 映射结果</h4>
+        <textarea id="plan_extract_output" rows="12" readonly placeholder="生成后会出现在这里，可直接复制，也会被一键带入新增用户弹窗。"></textarea>
+        <div class="mapping-actions">
+          <button type="button" class="btn btn-secondary" onclick="copyPlanMappingJson()">复制 JSON</button>
+        </div>
+        <div class="mapping-note">
+          输出结构与用户弹窗里的“周计划 JSON 映射”兼容。若你手填了 <code>seatPageId</code>，就优先使用它；没填时才自动回退为 <code>roomid</code>，并带上当前学校配置里的 <code>fidEnc</code>。
+        </div>
+      </div>
     </div>
   \`;
 }
@@ -2518,6 +3266,10 @@ function renderEditSchoolModal() {
               </div>
             </div>
             <div class="form-group">
+              <label>提交 day 日期偏移（仅服务器中转）</label>
+              <input type="number" id="edit_school_reserve_day_offset" min="0" step="1" value="\${s.reserve_day_offset === null || s.reserve_day_offset === undefined ? '' : s.reserve_day_offset}" placeholder="留空沿用预约明天；0 今天，1 明天，2 后天">
+            </div>
+            <div class="form-group">
               <label>服务器 API Key（留空则保留已有值；使用 ****** 表示不改）</label>
               <input type="text" id="edit_school_server_api_key" value="" placeholder="\${s.has_server_api_key ? '已配置，留空不修改' : '留空则使用 Worker 环境变量 SERVER_DISPATCH_API_KEY'}">
             </div>
@@ -2528,11 +3280,11 @@ function renderEditSchoolModal() {
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>触发时间 (HH:MM)</label>
+              <label>正式开始时间 (HH:MM)</label>
               <input type="text" id="edit_school_trigger" value="\${s.trigger_time || '19:57'}">
             </div>
             <div class="form-group">
-              <label>截止时间 (HH:MM:SS)</label>
+              <label>正式截止时间 (HH:MM:SS)</label>
               <input type="text" id="edit_school_endtime" value="\${s.endtime || '20:00:40'}">
             </div>
           </div>
@@ -2612,20 +3364,6 @@ function renderEditSchoolModal() {
               <input type="number" id="edit_strategy_prefetch" value="\${st.pre_fetch_token_ms || 1531}">
             </div>
           </div>
-          <div class="form-row">
-            <div class="form-group"></div>
-            <div class="form-group">
-              <label>并发连发偏移毫秒列表（burst_offsets_ms）</label>
-              <input type="text" id="edit_strategy_burst" value="\${(st.burst_offsets_ms || [120,420,820]).join(',')}" placeholder="例如: 120,420,820">
-            </div>
-          </div>
-          <div class="form-row">
-            <div class="form-group"></div>
-            <div class="form-group">
-              <label>burst_offsets_ms 抖动范围（burst_jitter_range_ms）</label>
-              <input type="text" id="edit_strategy_burst_jitter" value="\${(st.burst_jitter_range_ms || [0,0]).join(',')}" placeholder="例如: -30,30（会加到每个 burst 偏移）">
-            </div>
-          </div>
           <div style="font-size:12px;color:#666;margin-top:6px">
             说明：学校批量触发时，会按固定批次拆成多个 workflow；当前每个 workflow 默认承载 10 个用户。
           </div>
@@ -2701,7 +3439,7 @@ function renderUserModal() {
             <textarea id="edit_user_schedule_json" rows="8" placeholder='示例: [{"times":["09:00","23:00"],"roomid":"13484","seatid":["356"],"seatPageId":"13484","fidEnc":"4a18e12602b24c8c","daysofweek":["Monday","Tuesday"]}]'></textarea>
             <button type="button" class="btn btn-secondary" onclick="applyScheduleJsonToForm()" style="margin-top:8px">映射到周计划配置</button>
           </div>
-          <button class="btn btn-primary" onclick="doSaveUser()" style="width:100%;margin-top:16px">保存用户</button>
+          <button id="saveUserButton" class="btn btn-primary" onclick="doSaveUser()" style="width:100%;margin-top:16px">保存用户</button>
         </div>
       </div>
     </div>
@@ -2715,7 +3453,7 @@ function bindEvents() {
     const target = document.getElementById(targetId);
     const fields = document.getElementById(fieldsId);
     if (!target || !fields) return;
-    fields.style.display = target.value.trim().toLowerCase() === "server_relay" ? "" : "none";
+    fields.style.display = isServerRelayTarget(target.value) ? "" : "none";
   };
   if (addTarget && !addTarget.dataset.boundChange) {
     addTarget.addEventListener("change", () => toggleRelayFields("new_school_dispatch_target", "new_school_relay_fields"));
@@ -2771,6 +3509,8 @@ async function doAddSchool() {
   const endtime = document.getElementById("new_school_endtime").value.trim();
   const fidEnc = document.getElementById("new_school_fidEnc").value.trim();
   if (!id || !name) return toast("请填写必要信息", "error");
+  const formalTimeError = validateFormalTimeWindowInput(trigger_time, endtime);
+  if (formalTimeError) return toast(formalTimeError, "error");
   const body = {
     id,
     name,
@@ -2779,17 +3519,25 @@ async function doAddSchool() {
     conflict_group,
     github_token_key,
     trigger_time,
-    endtime,
+    endtime: normalizeClientEndtimeInput(endtime),
     fidEnc,
   };
   body.seat_api_mode = document.getElementById("new_school_seat_api_mode").value.trim().toLowerCase();
   body.reserve_next_day = document.getElementById("new_school_reserve_next_day").checked;
   body.enable_slider = document.getElementById("new_school_enable_slider").checked;
   body.enable_textclick = document.getElementById("new_school_enable_textclick").checked;
-  if (dispatch_target === "server_relay") {
+  if (isServerRelayTarget(dispatch_target)) {
     body.server_url = document.getElementById("new_school_server_url").value.trim();
     body.server_api_key = document.getElementById("new_school_server_api_key").value.trim();
     body.server_max_concurrency = parseInt(document.getElementById("new_school_server_max_concurrency").value, 10) || 13;
+    const reserveDayOffsetRaw = document.getElementById("new_school_reserve_day_offset").value;
+    const reserveDayOffset = normalizeReserveDayOffsetInput(reserveDayOffsetRaw);
+    if (String(reserveDayOffsetRaw || "").trim() && reserveDayOffset === null) {
+      return toast("提交 day 日期偏移只能填 0、1、2 这类非负整数", "error");
+    }
+    if (reserveDayOffset !== null) body.reserve_day_offset = reserveDayOffset;
+  } else {
+    body.reserve_day_offset = null;
   }
   const res = await api("POST", "/api/school", body);
   if (res.ok) {
@@ -2847,11 +3595,11 @@ async function doEditSchool() {
   const s = currentSchool;
   const githubTokenKey = document.getElementById("edit_school_github_token_key").value.trim().toLowerCase();
   const dispatchTarget = document.getElementById("edit_school_dispatch_target").value.trim().toLowerCase();
-  const burstOffsetsText = document.getElementById("edit_strategy_burst").value;
-  const burstOffsets = burstOffsetsText
-    .split(",")
-    .map(v => parseInt(v.trim(), 10))
-    .filter(v => !Number.isNaN(v));
+  const {
+    burst_offsets_ms: _burstOffsetsMs,
+    burst_jitter_range_ms: _burstJitterRangeMs,
+    ...baseStrategy
+  } = s.strategy || {};
   const parseRangeInput = (id, fallbackA, fallbackB) => {
     const text = (document.getElementById(id).value || "").trim();
     const arr = text.split(",").map(v => parseInt(v.trim(), 10)).filter(v => !Number.isNaN(v));
@@ -2859,7 +3607,6 @@ async function doEditSchool() {
     return [fallbackA, fallbackB];
   };
   const probeStartRange = parseRangeInput("edit_strategy_probe_start_range", 14, 14);
-  const burstJitterRange = parseRangeInput("edit_strategy_burst_jitter", 0, 0);
   const readingZonesRaw = (document.getElementById("edit_school_reading_zones").value || "").trim();
   let readingZoneGroups = [];
   if (readingZonesRaw) {
@@ -2875,18 +3622,22 @@ async function doEditSchool() {
       return toast("阅览区映射 JSON 解析失败: " + (e.message || String(e)), "error");
     }
   }
+  const triggerTime = document.getElementById("edit_school_trigger").value.trim();
+  const endtime = document.getElementById("edit_school_endtime").value.trim();
+  const formalTimeError = validateFormalTimeWindowInput(triggerTime, endtime);
+  if (formalTimeError) return toast(formalTimeError, "error");
   const body = {
     name: document.getElementById("edit_school_name").value.trim(),
     repo: document.getElementById("edit_school_repo").value.trim(),
     dispatch_target: dispatchTarget,
     conflict_group: document.getElementById("edit_school_conflict_group").value.trim(),
     github_token_key: githubTokenKey,
-    trigger_time: document.getElementById("edit_school_trigger").value.trim(),
-    endtime: document.getElementById("edit_school_endtime").value.trim(),
+    trigger_time: triggerTime,
+    endtime: normalizeClientEndtimeInput(endtime),
     fidEnc: document.getElementById("edit_school_fidEnc").value.trim(),
     reading_zone_groups: readingZoneGroups,
     strategy: {
-      ...s.strategy,
+      ...baseStrategy,
       mode: document.getElementById("edit_strategy_mode").value,
       submit_mode: document.getElementById("edit_strategy_submit").value,
       login_lead_seconds: parseInt(document.getElementById("edit_strategy_login").value) || 14,
@@ -2898,21 +3649,27 @@ async function doEditSchool() {
       token_fetch_delay_ms: parseInt(document.getElementById("edit_strategy_delay").value) || 45,
       first_token_date_mode: document.getElementById("edit_strategy_first_token_date_mode").value,
       fast_probe_start_range_ms: probeStartRange,
-      burst_offsets_ms: burstOffsets.length ? burstOffsets : [120, 420, 820],
-      burst_jitter_range_ms: burstJitterRange,
     }
   };
   body.seat_api_mode = document.getElementById("edit_school_seat_api_mode").value.trim().toLowerCase();
   body.reserve_next_day = document.getElementById("edit_school_reserve_next_day").checked;
   body.enable_slider = document.getElementById("edit_school_enable_slider").checked;
   body.enable_textclick = document.getElementById("edit_school_enable_textclick").checked;
-  if (dispatchTarget === "server_relay") {
+  if (isServerRelayTarget(dispatchTarget)) {
     body.server_url = document.getElementById("edit_school_server_url").value.trim();
     body.server_max_concurrency = parseInt(document.getElementById("edit_school_server_max_concurrency").value, 10) || 13;
+    const reserveDayOffsetRaw = document.getElementById("edit_school_reserve_day_offset").value;
+    const reserveDayOffset = normalizeReserveDayOffsetInput(reserveDayOffsetRaw);
+    if (String(reserveDayOffsetRaw || "").trim() && reserveDayOffset === null) {
+      return toast("提交 day 日期偏移只能填 0、1、2 这类非负整数", "error");
+    }
+    body.reserve_day_offset = reserveDayOffset;
     const serverApiKeyInput = document.getElementById("edit_school_server_api_key").value.trim();
     if (serverApiKeyInput && serverApiKeyInput !== "******") {
       body.server_api_key = serverApiKeyInput;
     }
+  } else {
+    body.reserve_day_offset = null;
   }
   const res = await api("PUT", "/api/school/" + s.id, body);
   if (res.ok) {
@@ -2947,7 +3704,44 @@ async function triggerSchool() {
   }
 }
 
-function showAddUser() {
+async function startTestEndtimeOverride() {
+  if (!currentSchool) return;
+  const input = document.getElementById("school_test_endtime");
+  const testEndtime = normalizeClientEndtimeInput(input && input.value);
+  if (!testEndtime) {
+    return toast("测试截止时间格式应为 HH:MM:SS", "error");
+  }
+
+  const res = await api("POST", "/api/school/" + currentSchool.id + "/test-endtime", {
+    test_endtime: testEndtime,
+  });
+  if (res.ok && res.school) {
+    currentSchool = res.school;
+    schools = upsertSchoolInOrderedList(schools, res.school);
+    render();
+    toast("测试覆盖已开启，3 分钟后自动关闭");
+  } else {
+    toast(res.error || "测试覆盖启动失败", "error");
+  }
+}
+
+async function stopTestEndtimeOverride() {
+  if (!currentSchool) return;
+  const res = await api("POST", "/api/school/" + currentSchool.id + "/test-endtime", {
+    action: "stop",
+  });
+  if (res.ok && res.school) {
+    currentSchool = res.school;
+    schools = upsertSchoolInOrderedList(schools, res.school);
+    render();
+    toast("测试覆盖已关闭");
+  } else {
+    toast(res.error || "测试覆盖关闭失败", "error");
+  }
+}
+
+function showAddUser(prefill = null) {
+  setUserSavePending(false);
   document.getElementById("userModalTitle").textContent = "添加用户";
   document.getElementById("edit_user_id").value = "";
   document.getElementById("edit_user_phone").value = "";
@@ -2967,10 +3761,26 @@ function showAddUser() {
     });
   });
   document.getElementById("edit_user_schedule_json").value = "";
+  if (prefill && typeof prefill === "object") {
+    document.getElementById("edit_user_phone").value = prefill.phone || "";
+    document.getElementById("edit_user_username").value = prefill.username || "";
+    document.getElementById("edit_user_password").value = prefill.password || "";
+    document.getElementById("edit_user_remark").value = prefill.remark || "";
+    if (prefill.schedule) {
+      fillScheduleFormFromSchedule(prefill.schedule);
+    }
+    if (prefill.scheduleJsonText) {
+      document.getElementById("edit_user_schedule_json").value = prefill.scheduleJsonText;
+      if (!prefill.schedule) {
+        fillScheduleFormFromSchedule(parseScheduleJsonMapping(prefill.scheduleJsonText));
+      }
+    }
+  }
   document.getElementById("userModal").classList.add("show");
 }
 
 async function showEditUser(userId) {
+  setUserSavePending(false);
   const res = await api("GET", "/api/school/" + currentSchool.id + "/user/" + userId);
   if (res.error) return toast(res.error, "error");
   const u = res.user;
@@ -2986,6 +3796,7 @@ async function showEditUser(userId) {
 }
 
 async function doSaveUser() {
+  if (isSavingUser) return;
   const userId = document.getElementById("edit_user_id").value;
   const phone = document.getElementById("edit_user_phone").value.trim();
   const username = document.getElementById("edit_user_username").value.trim();
@@ -3013,18 +3824,23 @@ async function doSaveUser() {
 
   const body = { phone, username, remark, schedule };
   if (password) body.password = password;
-  let res;
-  if (userId) {
-    res = await api("PUT", "/api/school/" + currentSchool.id + "/user/" + userId, body);
-  } else {
-    res = await api("POST", "/api/school/" + currentSchool.id + "/user", body);
-  }
-  if (res.ok) {
-    toast("用户已保存");
-    closeModal("userModal");
-    openSchool(currentSchool.id);
-  } else {
-    toast(res.error || "保存失败", "error");
+  setUserSavePending(true);
+  try {
+    let res;
+    if (userId) {
+      res = await api("PUT", "/api/school/" + currentSchool.id + "/user/" + userId, body);
+    } else {
+      res = await api("POST", "/api/school/" + currentSchool.id + "/user", body);
+    }
+    if (res.ok) {
+      toast("用户已保存");
+      closeModal("userModal");
+      openSchool(currentSchool.id);
+    } else {
+      toast(res.error || "保存失败", "error");
+    }
+  } finally {
+    setUserSavePending(false);
   }
 }
 
@@ -3067,6 +3883,8 @@ async function deleteUser(userId) {
 }
 
 // 初始化
+setInterval(updateTestEndtimeStatusView, 1000);
+
 (async function init() {
   try {
     if (API_KEY) {

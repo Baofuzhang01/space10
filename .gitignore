@@ -164,6 +164,8 @@ captcha_debug/
 config.json
 utils/config.json
 seat-qianduan.env.local
+utils/修改时间配置教程.docx
+utils/修改时间配置(6).docx
 
 # 本地部署记录
 DEPLOYMENT.md
@@ -171,5 +173,7 @@ DEPLOYMENT.md
 # 不上传到 GitHub 的本地目录
 pageexe/
 qianduan/
+server_runs/
+server_worker2_watchdog/
 server_store/
 deploy/
