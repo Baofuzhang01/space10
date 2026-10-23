@@ -1,11 +1,18 @@
 from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asymmetric_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 import base64
 from hashlib import md5
+import os
 
 from uuid import uuid1
 import hashlib
+
+
+PASSWORD_V2_PREFIX = "v2:rsa-oaep-sha256:"
+PASSWORD_PRIVATE_KEY_ENV = "PASSWORD_DECRYPTION_PRIVATE_KEY_B64"
 
 
 def AES_Encrypt(data):
@@ -20,12 +27,8 @@ def AES_Encrypt(data):
     return enctext
 
 
-def AES_Decrypt(ciphertext_b64):
-    """AES-CBC 解密，与 AES_Encrypt 配对使用。
-
-    Worker 端用 Web Crypto API 加密后存入 KV，dispatch 传密文到 Actions，
-    main.py 调用此函数解密得到明文密码。
-    """
+def _legacy_aes_decrypt(ciphertext_b64):
+    """Decrypt the legacy database format. New passwords must not use it."""
     key = b"u2oh6Vu^HWe4_AES"
     iv = b"u2oh6Vu^HWe4_AES"
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
@@ -34,6 +37,65 @@ def AES_Decrypt(ciphertext_b64):
     unpadder = padding.PKCS7(128).unpadder()
     plaintext = unpadder.update(padded_data) + unpadder.finalize()
     return plaintext.decode("utf-8")
+
+
+def _load_password_private_key():
+    encoded_key = os.environ.get(PASSWORD_PRIVATE_KEY_ENV, "").strip()
+    if not encoded_key:
+        raise RuntimeError(
+            f"{PASSWORD_PRIVATE_KEY_ENV} is required to decrypt v2 passwords"
+        )
+    try:
+        private_key_pem = base64.b64decode(encoded_key, validate=True)
+        return serialization.load_pem_private_key(private_key_pem, password=None)
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"{PASSWORD_PRIVATE_KEY_ENV} is invalid") from exc
+
+
+def encrypt_password_v2(plaintext, public_key_pem):
+    """Encrypt a newly entered password with the website's public key."""
+    public_key = serialization.load_pem_public_key(public_key_pem)
+    ciphertext = public_key.encrypt(
+        str(plaintext).encode("utf-8"),
+        asymmetric_padding.OAEP(
+            mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+    return PASSWORD_V2_PREFIX + base64.b64encode(ciphertext).decode("ascii")
+
+
+def _decrypt_password_v2(ciphertext):
+    encoded_ciphertext = ciphertext[len(PASSWORD_V2_PREFIX):]
+    try:
+        encrypted_bytes = base64.b64decode(encoded_ciphertext, validate=True)
+        plaintext = _load_password_private_key().decrypt(
+            encrypted_bytes,
+            asymmetric_padding.OAEP(
+                mgf=asymmetric_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        )
+    except RuntimeError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid v2 password ciphertext") from exc
+    return plaintext.decode("utf-8")
+
+
+def AES_Decrypt(ciphertext_b64):
+    """Decrypt stored passwords while keeping the legacy format compatible.
+
+    Values prefixed with ``v2:rsa-oaep-sha256:`` use the private key supplied
+    at runtime. Unprefixed values keep using the existing AES-CBC path so old
+    users continue working until they update their password.
+    """
+    ciphertext = str(ciphertext_b64 or "")
+    if ciphertext.startswith(PASSWORD_V2_PREFIX):
+        return _decrypt_password_v2(ciphertext)
+    return _legacy_aes_decrypt(ciphertext)
 
 
 def resort(submit_info):
